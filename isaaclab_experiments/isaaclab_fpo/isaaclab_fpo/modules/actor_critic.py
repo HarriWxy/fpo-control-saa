@@ -165,7 +165,7 @@ class ActorCritic(nn.Module):
         """Compute CFM loss for training.
 
         Returns:
-            Tuple of (loss, x1_pred, x0_pred)
+            Tuple of (loss, x1_pred, x0_pred)  x1_pred and x0_pred are the predicted next and current states, respectively.
         """
         # Use provided actor or default to self.actor
         if actor is None:

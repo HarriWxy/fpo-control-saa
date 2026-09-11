@@ -437,6 +437,37 @@ class OnPolicyRunner:
                     self.tot_time,
                 )
 
+        # PPO-compatible TensorBoard aliases.
+        metrics = locs["loss_dict"].get("metrics", {})
+        surrogate_loss = locs["loss_dict"].get("surrogate_loss", 0.0)
+        value_loss = locs["loss_dict"].get("value_loss", 0.0)
+        # PPO logs the negative entropy estimate before applying its coefficient.
+        entropy_loss = -locs["loss_dict"].get("entropy_loss", 0.0)
+        ppo_scalars = {
+            "time/fps": fps,
+            "train/approx_kl": metrics.get("approx_kl", metrics.get("kl", 0.0)),
+            "train/clip_fraction": metrics.get("clip_fraction", 0.0),
+            "train/clip_range": metrics.get("clip_param", self.alg.clip_param),
+            "train/entropy_loss": entropy_loss,
+            "train/explained_variance": metrics.get("explained_variance", 0.0),
+            "train/learning_rate": self.alg.learning_rate,
+            "train/loss": surrogate_loss
+            + self.alg.value_loss_coef * value_loss
+            + self.alg.knn_entropy_coef * entropy_loss,
+            "train/pg_loss": surrogate_loss,
+            "train/policy_gradient_loss": surrogate_loss,
+            "train/std": metrics.get("action_std", 0.0),
+            "train/value_loss": value_loss,
+        }
+        if locs["rewbuffer"]:
+            ppo_scalars.update(
+                {
+                    "rollout/ep_len_mean": statistics.mean(locs["lenbuffer"]),
+                    "rollout/ep_rew_mean": statistics.mean(locs["rewbuffer"]),
+                }
+            )
+        for tag, value in ppo_scalars.items():
+            self.writer.add_scalar(tag, value, locs["it"])
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
         if len(locs["rewbuffer"]) > 0:

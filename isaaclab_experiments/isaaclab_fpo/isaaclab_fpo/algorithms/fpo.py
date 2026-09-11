@@ -271,11 +271,14 @@ class FPO:
         )
 
     def update(self, obs_normalizer=None, privileged_obs_normalizer=None):  # noqa: C901
+        '''Update the policy using the collected experience.'''
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_kl = 0
 
+        mean_approx_kl = 0
+        mean_clip_fraction = 0
         # Gradient norm tracking (kept for metrics, not histograms)
         all_grad_norms_before = []
         all_grad_norms_after = []
@@ -442,13 +445,24 @@ class FPO:
 
             # Per-sample log ratios (no averaging before exp)
             # Each of the n_samples gets its own ratio, providing more gradient diversity
-            log_ratio = old_cfm_loss_batch - cfm_loss_batch
-            log_ratio = clamp_ste(log_ratio, max=self.cfm_diff_clamp_max)
+            raw_log_ratio = old_cfm_loss_batch - cfm_loss_batch
+            log_ratio = clamp_ste(raw_log_ratio, max=self.cfm_diff_clamp_max)
             ratio = torch.exp(log_ratio)
             assert ratio.shape == (
                 batch_size,
                 self.n_samples_per_action,
             )
+
+            with torch.no_grad():
+                mean_approx_kl += (
+                    0.5 * raw_log_ratio.detach().square().mean().item()
+                )
+                mean_clip_fraction += (
+                    (torch.abs(ratio.detach() - 1.0) > self.clip_param)
+                    .float()
+                    .mean()
+                    .item()
+                )
 
             # Surrogate computation
             if self.trust_region_mode == "ppo":
@@ -546,9 +560,24 @@ class FPO:
         mean_entropy /= num_updates
         if self.schedule == "adaptive":
             mean_kl /= num_updates
-        self.storage.clear()
+        mean_approx_kl /= num_updates
+        mean_clip_fraction /= num_updates
+        with torch.no_grad():
+            returns = self.storage.returns
+            values = self.storage.values
+            var_y = torch.var(returns, unbiased=False)
+            if var_y.item() > 1e-8:
+                explained_variance = (
+                    1.0 - torch.var(returns - values, unbiased=False) / var_y
+                ).item()
+            else:
+                explained_variance = 0.0
+            action_std = self.storage.actions.std(
+                dim=(0, 1), unbiased=False
+            ).mean().item()
 
         # Increment counters
+        self.storage.clear()
         self.update_counter += 1
         self.tot_timesteps += 1
 
@@ -563,6 +592,10 @@ class FPO:
         # construct the metrics dictionary (non-loss metrics)
         metrics_dict = {
             "clip_param": self.clip_param,
+            "approx_kl": mean_approx_kl,
+            "clip_fraction": mean_clip_fraction,
+            "explained_variance": explained_variance,
+            "action_std": action_std,
         }
         if self.schedule == "adaptive":
             metrics_dict["kl"] = mean_kl
