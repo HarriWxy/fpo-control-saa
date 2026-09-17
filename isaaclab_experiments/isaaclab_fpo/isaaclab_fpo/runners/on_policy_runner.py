@@ -14,7 +14,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 import isaaclab_fpo
-from isaaclab_fpo.algorithms import FPO
+from isaaclab_fpo.algorithms import FPO, IMFFPO
 
 if TYPE_CHECKING:
     from isaaclab_fpo.rl_cfg import FpoRslRlOnPolicyRunnerCfg
@@ -22,6 +22,7 @@ from isaaclab_fpo.env import VecEnv
 from isaaclab_fpo.modules import (
     ActorCritic,
     EmpiricalNormalization,
+    IMFActorCritic,
 )
 from isaaclab_fpo.utils import store_code_state
 
@@ -57,14 +58,48 @@ class OnPolicyRunner:
         else:
             num_privileged_obs = num_obs
 
-        # initialize policy with config dataclass
-        policy: ActorCritic = ActorCritic(
+        # ``class_name`` used to be descriptive only.  Keep the legacy names
+        # and make the iMF implementation explicitly selectable so old FPO
+        # checkpoints retain their original actor layout.
+        policy_classes = {
+            "ActorCritic": ActorCritic,
+            "IMFActorCritic": IMFActorCritic,
+        }
+        algorithm_classes = {
+            "FPO": FPO,
+            "IMFFPO": IMFFPO,
+        }
+        try:
+            policy_class = policy_classes[train_cfg.policy.class_name]
+        except KeyError as exc:
+            raise ValueError(
+                "Unknown policy class "
+                f"{train_cfg.policy.class_name!r}; expected one of "
+                f"{sorted(policy_classes)}"
+            ) from exc
+        try:
+            algorithm_class = algorithm_classes[train_cfg.algorithm.class_name]
+        except KeyError as exc:
+            raise ValueError(
+                "Unknown algorithm class "
+                f"{train_cfg.algorithm.class_name!r}; expected one of "
+                f"{sorted(algorithm_classes)}"
+            ) from exc
+        if (policy_class is IMFActorCritic) != (algorithm_class is IMFFPO):
+            raise ValueError(
+                "IMFActorCritic and IMFFPO must be selected together; got "
+                f"policy={train_cfg.policy.class_name!r}, "
+                f"algorithm={train_cfg.algorithm.class_name!r}"
+            )
+
+        policy: ActorCritic = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, cfg=train_cfg.policy
         ).to(self.device)
-
-        # initialize algorithm with config dataclass
-        self.alg: FPO = FPO(
-            policy, cfg=train_cfg.algorithm, device=self.device, multi_gpu_cfg=self.multi_gpu_cfg
+        self.alg: FPO = algorithm_class(
+            policy,
+            cfg=train_cfg.algorithm,
+            device=self.device,
+            multi_gpu_cfg=self.multi_gpu_cfg,
         )
 
         # store training configuration
@@ -543,6 +578,8 @@ class OnPolicyRunner:
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
+            "policy_class_name": self.cfg.policy.class_name,
+            "algorithm_class_name": self.cfg.algorithm.class_name,
         }
         # -- Save EMA state if used
         if self.alg.ema is not None:
@@ -563,6 +600,28 @@ class OnPolicyRunner:
 
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
+        saved_policy_class = loaded_dict.get("policy_class_name")
+        saved_algorithm_class = loaded_dict.get("algorithm_class_name")
+        if (
+            saved_policy_class is not None
+            and saved_policy_class != self.cfg.policy.class_name
+        ):
+            raise ValueError(
+                "Checkpoint policy class mismatch: checkpoint uses "
+                f"{saved_policy_class!r}, but this runner was configured for "
+                f"{self.cfg.policy.class_name!r}. Select the matching "
+                "--algorithm variant before loading."
+            )
+        if (
+            saved_algorithm_class is not None
+            and saved_algorithm_class != self.cfg.algorithm.class_name
+        ):
+            raise ValueError(
+                "Checkpoint algorithm class mismatch: checkpoint uses "
+                f"{saved_algorithm_class!r}, but this runner was configured for "
+                f"{self.cfg.algorithm.class_name!r}. Select the matching "
+                "--algorithm variant before loading."
+            )
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(
             loaded_dict["model_state_dict"]

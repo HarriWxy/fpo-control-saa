@@ -14,6 +14,16 @@ def add_fpo_args(parser: argparse.ArgumentParser):
     arg_group.add_argument(
         "--experiment_name", type=str, default=None, help="Name of the experiment folder where logs will be stored."
     )
+    arg_group.add_argument(
+        "--algorithm",
+        type=str,
+        default=None,
+        choices=("fpo", "imf_fpo"),
+        help=(
+            "Policy variant. 'imf_fpo' selects the experimental Improved "
+            "MeanFlow actor and FPO surrogate; omitted keeps the task default."
+        ),
+    )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
     arg_group.add_argument("--resume", action="store_true", default=False, help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
@@ -32,6 +42,10 @@ def parse_fpo_cfg(task_name: str, args_cli: argparse.Namespace) -> FpoRslRlOnPol
     Looks up the task config from the isaaclab_fpo registry instead of gym kwargs.
     """
     from isaaclab_fpo.task_cfgs import TASK_CONFIGS
+
+    # train receives a task ID directly while some play scripts pass an
+    # IsaacLab namespace prefix.  The registry stores the bare Gym task ID.
+    task_name = task_name.split(":")[-1]
 
     if task_name not in TASK_CONFIGS:
         raise KeyError(
@@ -57,10 +71,29 @@ def update_fpo_cfg(agent_cfg: FpoRslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.load_checkpoint = args_cli.checkpoint
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
+    if args_cli.experiment_name is not None:
+        agent_cfg.experiment_name = args_cli.experiment_name
     if args_cli.logger is not None:
         agent_cfg.logger = args_cli.logger
     if agent_cfg.logger in {"wandb", "neptune"} and args_cli.log_project_name:
         agent_cfg.wandb_project = args_cli.log_project_name
         agent_cfg.neptune_project = args_cli.log_project_name
+
+    algorithm_variant = getattr(args_cli, "algorithm", None)
+    if algorithm_variant == "fpo":
+        agent_cfg.policy.class_name = "ActorCritic"
+        agent_cfg.algorithm.class_name = "FPO"
+    elif algorithm_variant == "imf_fpo":
+        agent_cfg.policy.class_name = "IMFActorCritic"
+        agent_cfg.algorithm.class_name = "IMFFPO"
+        # iMF is a fast-forward policy by construction.  More steps remain a
+        # supported ablation and can be overridden through agent.policy.
+        agent_cfg.policy.sampling_steps = 1
+        # Do not silently reinterpret FPO's CFM endpoint proxies as mean-flow
+        # KL/entropy estimates.  IMFFPO validates these safe defaults too.
+        agent_cfg.algorithm.schedule = "fixed"
+        agent_cfg.algorithm.knn_entropy_coef = 0.0
+        if args_cli.experiment_name is None:
+            agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_imf_fpo"
 
     return agent_cfg

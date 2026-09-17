@@ -18,6 +18,10 @@ if TYPE_CHECKING:
 
 class ActorCritic(nn.Module):
     is_recurrent = False
+    # Subclasses can add flow-time conditions or actor heads without changing
+    # the default CFM actor checkpoint layout.
+    actor_num_time_embeddings = 1
+    actor_output_multiplier = 1
 
     def __init__(
         self,
@@ -51,7 +55,11 @@ class ActorCritic(nn.Module):
         # Policy Network: Actor
         actor_hidden_dims = cfg.actor_hidden_dims
         critic_hidden_dims = cfg.critic_hidden_dims
-        mlp_input_dim_a = num_actor_obs + self.timestep_embed_dim + num_actions
+        mlp_input_dim_a = (
+            num_actor_obs
+            + self.actor_num_time_embeddings * self.timestep_embed_dim
+            + num_actions
+        )
         mlp_input_dim_c = num_critic_obs
         actor_layers = []
         actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
@@ -59,7 +67,10 @@ class ActorCritic(nn.Module):
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
                 actor_layers.append(
-                    nn.Linear(actor_hidden_dims[layer_index], num_actions)
+                    nn.Linear(
+                        actor_hidden_dims[layer_index],
+                        self.actor_output_multiplier * num_actions,
+                    )
                 )
             else:
                 actor_layers.append(
@@ -221,6 +232,29 @@ class ActorCritic(nn.Module):
         assert out.shape == (*t.shape[:-1], self.timestep_embed_dim)
         return out
 
+    def flow_step(
+        self,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        r: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Take one reverse flow step in the scaled action space.
+
+        This small public interface is used by diagnostic tools instead of
+        assuming a particular actor input layout.  For CFM, it is an Euler
+        step of the instantaneous velocity field.
+        """
+        batch_size = observations.shape[0]
+        assert observations.shape == (batch_size, self.num_actor_obs)
+        assert x_t.shape == (batch_size, self.num_actions)
+        assert r.shape == t.shape == (batch_size, 1)
+
+        embedded_t = self._embed_timestep(t)
+        velocity = self.actor(torch.cat([observations, embedded_t, x_t], dim=-1))
+        velocity = self.mlp_output_scale * velocity
+        return x_t + velocity * (r - t)
+
     def _integrate_flow(
         self,
         observations: torch.Tensor,
@@ -336,3 +370,268 @@ class ActorCritic(nn.Module):
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+
+class IMFActorCritic(ActorCritic):
+    """Conditional improved-MeanFlow actor with the original FPO critic.
+
+    The actor predicts an average velocity ``u(s, z_t, r, t)`` over the
+    interval ``[r, t]`` and an auxiliary instantaneous velocity
+    ``v(s, z_t, t)``.  The latter is evaluated at the boundary ``r=t`` so it
+    does not acquire an accidental dependence on the interval length.
+
+    All flow quantities use the same *scaled action space* as ``ActorCritic``:
+    action scaling happens only at the public ``act``/``act_inference``
+    boundary.  This preserves the FPO action contract.
+    """
+
+    actor_num_time_embeddings = 2
+    actor_output_multiplier = 2
+    is_improved_mean_flow = True
+
+    def __init__(
+        self,
+        num_actor_obs: int,
+        num_critic_obs: int,
+        num_actions: int,
+        cfg: FpoRslRlPpoActorCriticCfg,
+    ):
+        super().__init__(num_actor_obs, num_critic_obs, num_actions, cfg)
+
+        self.imf_aux_v_loss_coef = cfg.imf_aux_v_loss_coef
+        self.imf_adaptive_gradient_norm_p = cfg.imf_adaptive_gradient_norm_p
+        self.imf_adaptive_gradient_norm_eps = cfg.imf_adaptive_gradient_norm_eps
+        self.imf_logit_normal_mean = cfg.imf_logit_normal_mean
+        self.imf_logit_normal_std = cfg.imf_logit_normal_std
+        self.imf_fm_proportion = cfg.imf_fm_proportion
+
+        if self.imf_aux_v_loss_coef < 0:
+            raise ValueError("imf_aux_v_loss_coef must be non-negative")
+        if self.imf_adaptive_gradient_norm_p < 0:
+            raise ValueError("imf_adaptive_gradient_norm_p must be non-negative")
+        if self.imf_adaptive_gradient_norm_eps <= 0:
+            raise ValueError("imf_adaptive_gradient_norm_eps must be positive")
+        if self.imf_logit_normal_std <= 0:
+            raise ValueError("imf_logit_normal_std must be positive")
+        if not 0.0 <= self.imf_fm_proportion <= 1.0:
+            raise ValueError("imf_fm_proportion must be in [0, 1]")
+
+    def _predict_u_and_v(
+        self,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        r: torch.Tensor,
+        t: torch.Tensor,
+        actor: torch.nn.Module | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict mean and instantaneous velocities for flattened samples.
+
+        Args:
+            observations: ``[batch, obs_dim]`` fixed policy conditions.
+            x_t: ``[batch, action_dim]`` point on the noise--action path.
+            r, t: ``[batch, 1]`` interval endpoints with ``r <= t``.
+            actor: Optional actor module, primarily useful for evaluation.
+        """
+        if actor is None:
+            actor = self.actor
+
+        batch_size = observations.shape[0]
+        assert observations.shape == (batch_size, self.num_actor_obs)
+        assert x_t.shape == (batch_size, self.num_actions)
+        assert r.shape == t.shape == (batch_size, 1)
+
+        embedded_r = self._embed_timestep(r)
+        embedded_t = self._embed_timestep(t)
+        output = actor(torch.cat([observations, embedded_r, embedded_t, x_t], dim=-1))
+        output = self.mlp_output_scale * output
+        mean_velocity, instantaneous_velocity = output.split(self.num_actions, dim=-1)
+        assert mean_velocity.shape == instantaneous_velocity.shape == x_t.shape
+        return mean_velocity, instantaneous_velocity
+
+    def _with_imf_gradient_normalization(self, loss: torch.Tensor) -> torch.Tensor:
+        """Keep raw iMF scores while optionally normalizing their gradients.
+
+        The official iMF adaptive loss has a nearly constant forward value for
+        exponent one.  That cannot be inserted directly into FPO's
+        ``exp(old_score - new_score)`` surrogate.  This straight-through form
+        retains the unmodified residual as the score while applying the
+        requested iMF-style normalization only to its gradient.
+        """
+        if self.imf_adaptive_gradient_norm_p == 0.0:
+            return loss
+
+        denominator = (
+            loss.detach() + self.imf_adaptive_gradient_norm_eps
+        ).pow(self.imf_adaptive_gradient_norm_p)
+        normalized_loss = loss / denominator
+        return loss.detach() + normalized_loss - normalized_loss.detach()
+
+    def get_imf_loss(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        eps: torch.Tensor,
+        r: torch.Tensor,
+        t: torch.Tensor,
+        actor: torch.nn.Module | None = None,
+        return_components: bool = False,
+    ):
+        """Compute the improved-MeanFlow score used by experimental IMF-FPO.
+
+        For ``z_t = t * eps + (1-t) * action``, iMF trains the compound
+        instantaneous field
+
+        ``V = u_theta(z_t, r, t) + (t-r) * stopgrad(JVP(u; (v_theta, 0, 1)))``
+
+        against ``eps - action``.  ``v_theta`` is the auxiliary head evaluated
+        at ``r=t``.  Both the iMF residual and the auxiliary velocity residual
+        are returned as a per-Monte-Carlo-sample score.  The caller must store
+        and replay the same ``eps``, ``r``, and ``t`` when forming FPO ratios.
+
+        This is an experimental FPO score surrogate: unlike the original CFM
+        score, iMF's JVP residual has no established likelihood-ratio/ELBO
+        derivation.
+        """
+        if actor is None:
+            actor = self.actor
+
+        batch_size, action_dim = actions.shape
+        assert observations.shape == (batch_size, self.num_actor_obs)
+        assert action_dim == self.num_actions
+
+        n_samples_per_action = eps.shape[1]
+        expected_noise_shape = (batch_size, n_samples_per_action, action_dim)
+        expected_time_shape = (batch_size, n_samples_per_action, 1)
+        assert eps.shape == expected_noise_shape
+        assert r.shape == t.shape == expected_time_shape
+
+        scaled_actions = actions / self.actor_scale
+        x_t = t * eps + (1.0 - t) * scaled_actions[:, None, :]
+        target_velocity = eps - scaled_actions[:, None, :]
+
+        # Work on a flat batch and treat observations as a fixed condition, so
+        # the JVP is only along (z_t, r, t).
+        flat_size = batch_size * n_samples_per_action
+        flat_observations = (
+            observations[:, None, :]
+            .expand(batch_size, n_samples_per_action, -1)
+            .reshape(flat_size, self.num_actor_obs)
+        )
+        flat_x_t = x_t.reshape(flat_size, action_dim)
+        flat_r = r.reshape(flat_size, 1)
+        flat_t = t.reshape(flat_size, 1)
+        flat_target = target_velocity.reshape(flat_size, action_dim)
+
+        # v_theta(z_t, t) is evaluated on the h=t-r=0 boundary.  It drives
+        # the JVP tangent and gets its own direct regression loss.
+        _, instantaneous_velocity = self._predict_u_and_v(
+            flat_observations, flat_x_t, flat_t, flat_t, actor=actor
+        )
+        mean_velocity, _ = self._predict_u_and_v(
+            flat_observations, flat_x_t, flat_r, flat_t, actor=actor
+        )
+
+        def mean_velocity_fn(
+            z_input: torch.Tensor, r_input: torch.Tensor, t_input: torch.Tensor
+        ) -> torch.Tensor:
+            mean_velocity, _ = self._predict_u_and_v(
+                flat_observations, z_input, r_input, t_input, actor=actor
+            )
+            return mean_velocity
+
+        # iMF explicitly stop-grads this derivative.  The autograd.functional
+        # implementation is deliberately used with create_graph=False: it
+        # supports the project's standard MLP activations on current PyTorch
+        # builds while avoiding a second-order parameter graph.
+        _, mean_velocity_time_derivative = torch.autograd.functional.jvp(
+            mean_velocity_fn,
+            (flat_x_t, flat_r, flat_t),
+            (
+                instantaneous_velocity.detach(),
+                torch.zeros_like(flat_r),
+                torch.ones_like(flat_t),
+            ),
+            create_graph=False,
+        )
+        compound_velocity = mean_velocity + (flat_t - flat_r) * (
+            mean_velocity_time_derivative.detach()
+        )
+
+        imf_u_loss = self._compute_squared_error(compound_velocity, flat_target)
+        imf_v_loss = self._compute_squared_error(
+            instantaneous_velocity, flat_target
+        )
+        score = self._with_imf_gradient_normalization(imf_u_loss)
+        score = score + self.imf_aux_v_loss_coef * self._with_imf_gradient_normalization(
+            imf_v_loss
+        )
+
+        # Reuse the old FPO diagnostics interface with the local auxiliary-v
+        # endpoint estimates.  They are proxies, not a mean-flow KL.
+        x0_pred = flat_x_t - flat_t * instantaneous_velocity
+        x1_pred = x0_pred + instantaneous_velocity
+
+        score = score.reshape(batch_size, n_samples_per_action)
+        x0_pred = x0_pred.reshape(batch_size, n_samples_per_action, action_dim)
+        x1_pred = x1_pred.reshape(batch_size, n_samples_per_action, action_dim)
+        assert score.shape == (batch_size, n_samples_per_action)
+
+        if return_components:
+            components = {
+                "u_loss": imf_u_loss.reshape(batch_size, n_samples_per_action),
+                "v_loss": imf_v_loss.reshape(batch_size, n_samples_per_action),
+                "interval": (flat_t - flat_r).reshape(
+                    batch_size, n_samples_per_action
+                ),
+                "jvp_norm": mean_velocity_time_derivative.detach()
+                .norm(dim=-1)
+                .reshape(batch_size, n_samples_per_action),
+            }
+            return score, x1_pred, x0_pred, components
+        return score, x1_pred, x0_pred
+
+    def flow_step(
+        self,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        r: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Take one iMF average-velocity jump in the scaled action space."""
+        mean_velocity, _ = self._predict_u_and_v(observations, x_t, r, t)
+        return x_t - (t - r) * mean_velocity
+
+    def _integrate_flow(
+        self,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        t_current: torch.Tensor,
+        dt: torch.Tensor,
+        flow_steps: int,
+    ) -> torch.Tensor:
+        """Integrate mean-flow jumps from noise time one to action time zero."""
+        batch_size = observations.shape[0]
+        half_dim = self.timestep_embed_dim // 2
+        freqs = 2 ** torch.arange(
+            half_dim, device=observations.device, dtype=observations.dtype
+        )
+
+        for i in range(flow_steps):
+            t_value = t_current[i].reshape(1, 1)
+            r_value = (t_current[i] + dt[i]).reshape(1, 1)
+            embedded_r = torch.cat(
+                [torch.cos(r_value * freqs), torch.sin(r_value * freqs)], dim=-1
+            ).expand(batch_size, -1)
+            embedded_t = torch.cat(
+                [torch.cos(t_value * freqs), torch.sin(t_value * freqs)], dim=-1
+            ).expand(batch_size, -1)
+            output = self.actor(
+                torch.cat([observations, embedded_r, embedded_t, x_t], dim=-1)
+            )
+            mean_velocity = self.mlp_output_scale * output[:, : self.num_actions]
+
+            # dt = r - t is negative during reverse generation, hence this is
+            # exactly x_r = x_t - (t-r) * u_theta(x_t, r, t).
+            x_t = x_t + mean_velocity * dt[i]
+
+        return x_t

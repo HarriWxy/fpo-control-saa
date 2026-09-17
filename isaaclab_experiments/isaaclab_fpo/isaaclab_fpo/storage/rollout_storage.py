@@ -21,11 +21,13 @@ class RolloutStorage:
             self.values = None
             self.hidden_states = None
 
-            # CFM-specific terms.
+            # Flow-score terms.  ``meanflow_loss_r`` is zero for the legacy
+            # CFM path and stores the second iMF interval endpoint otherwise.
             self.initial_cfm_loss = None
             self.x1_pred = None
             self.cfm_loss_eps = None
             self.cfm_loss_t = None
+            self.meanflow_loss_r = None
 
         def clear(self):
             self.__init__()
@@ -103,6 +105,13 @@ class RolloutStorage:
             1,
             device=self.device,
         )
+        self.meanflow_loss_r = torch.zeros(
+            num_transitions_per_env,
+            num_envs,
+            self.n_samples_per_action,
+            1,
+            device=self.device,
+        )
         self.x1_pred = torch.zeros(
             num_transitions_per_env, num_envs, n_samples_per_action, *actions_shape, device=self.device
         )
@@ -135,6 +144,7 @@ class RolloutStorage:
         self.initial_cfm_loss[self.step].copy_(transition.initial_cfm_loss)
         self.cfm_loss_eps[self.step].copy_(transition.cfm_loss_eps)
         self.cfm_loss_t[self.step].copy_(transition.cfm_loss_t)
+        self.meanflow_loss_r[self.step].copy_(transition.meanflow_loss_r)
         self.x1_pred[self.step].copy_(transition.x1_pred)
 
         # For RNN networks
@@ -227,6 +237,7 @@ class RolloutStorage:
         old_cfm_loss = self.initial_cfm_loss.flatten(0, 1)
         old_cfm_eps = self.cfm_loss_eps.flatten(0, 1)
         old_cfm_t = self.cfm_loss_t.flatten(0, 1)
+        old_meanflow_r = self.meanflow_loss_r.flatten(0, 1)
         old_x1_pred = self.x1_pred.flatten(0, 1)
 
         for epoch in range(num_epochs):
@@ -245,6 +256,7 @@ class RolloutStorage:
                 old_cfm_loss_batch = old_cfm_loss[batch_idx]
                 old_cfm_eps_batch = old_cfm_eps[batch_idx]
                 old_cfm_t_batch = old_cfm_t[batch_idx]
+                old_meanflow_r_batch = old_meanflow_r[batch_idx]
                 old_x1_pred_batch = old_x1_pred[batch_idx]
 
                 yield (
@@ -258,6 +270,7 @@ class RolloutStorage:
                     old_cfm_loss_batch,
                     old_cfm_eps_batch,
                     old_cfm_t_batch,
+                    old_meanflow_r_batch,
                     (
                         None,
                         None,
@@ -306,6 +319,7 @@ class RolloutStorage:
                 old_cfm_loss_batch = self.initial_cfm_loss[:, start:stop]
                 old_cfm_eps_batch = self.cfm_loss_eps[:, start:stop]
                 old_cfm_t_batch = self.cfm_loss_t[:, start:stop]
+                old_meanflow_r_batch = self.meanflow_loss_r[:, start:stop]
 
                 # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
                 # then take only time steps after dones (flattens num envs and time dimensions),
@@ -342,6 +356,7 @@ class RolloutStorage:
                     old_cfm_loss_batch,
                     old_cfm_eps_batch,
                     old_cfm_t_batch,
+                    old_meanflow_r_batch,
                     (
                         hid_a_batch,
                         hid_c_batch,

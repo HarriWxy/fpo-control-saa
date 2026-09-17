@@ -12,7 +12,7 @@ import torch.optim as optim
 
 from typing import TYPE_CHECKING
 
-from isaaclab_fpo.modules import ActorCritic
+from isaaclab_fpo.modules import ActorCritic, IMFActorCritic
 from isaaclab_fpo.modules.ema import ExponentialMovingAverage
 from isaaclab_fpo.storage import RolloutStorage
 
@@ -110,6 +110,7 @@ class FPO:
         self.storage_action_noise_std = cfg.storage_action_noise_std
         self.trust_region_mode = cfg.trust_region_mode
         self.update_counter = 0
+        self.flow_score_name = "cfm_score"
 
     def init_storage(
         self,
@@ -128,6 +129,36 @@ class FPO:
             self.device,
             self.n_samples_per_action,
         )
+
+    def _sample_flow_score_times(
+        self, num_envs: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample legacy CFM times and a zero iMF endpoint placeholder."""
+        uniform_t = torch.rand(
+            (num_envs, self.n_samples_per_action, 1), device=self.device
+        )
+        # For Beta(1, beta), F^{-1}(u) = 1 - (1-u)^(1/beta).  Keep away
+        # from the endpoints, matching the pre-iMF FPO implementation.
+        beta = self.policy.cfm_loss_t_inverse_cdf_beta
+        t = 0.005 + 0.99 * (1.0 - (1.0 - uniform_t) ** (1.0 / beta))
+        return t, torch.zeros_like(t)
+
+    def _compute_flow_score(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        eps: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        *,
+        return_components: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Return the replayable FPO score and diagnostic endpoint proxies."""
+        del r, return_components
+        score, x1_pred, x0_pred = self.policy.get_cfm_loss(
+            observations, actions, eps, t
+        )
+        return score, x1_pred, x0_pred, {}
 
     def act(self, obs, critic_obs):
         # Shape assertions
@@ -165,22 +196,15 @@ class FPO:
             f"Expected values shape [{self.storage.num_envs}, 1], got {self.transition.values.shape}"
         )
 
-        # FPO stuff
+        # Flow-score samples.  CFM uses only ``t``; IMF-FPO additionally
+        # records its lower interval endpoint ``r`` for exact replay.
         cfm_loss_eps = torch.randn(
             (self.storage.num_envs, self.n_samples_per_action, self.policy.num_actions),
             device=self.device,
         )
-
-        # Sample uniform timesteps
-        uniform_t = torch.rand(
-            (self.storage.num_envs, self.n_samples_per_action, 1), device=self.device
+        cfm_loss_t, meanflow_loss_r = self._sample_flow_score_times(
+            self.storage.num_envs
         )
-
-        # Apply inverse CDF transform using beta parameter
-        # For Beta(1, beta) distribution: F^{-1}(u) = 1 - (1-u)^(1/beta)
-        # Scale to [0.005, 0.995] to avoid boundary instabilities at t=0 and t=1
-        beta = self.policy.cfm_loss_t_inverse_cdf_beta
-        cfm_loss_t = 0.005 + 0.99 * (1.0 - (1.0 - uniform_t) ** (1.0 / beta))
 
         # Shape assertions for CFM inputs
         assert cfm_loss_eps.shape == (
@@ -193,13 +217,19 @@ class FPO:
             self.n_samples_per_action,
             1,
         )
+        assert meanflow_loss_r.shape == cfm_loss_t.shape
 
         (
             self.transition.initial_cfm_loss,
             self.transition.x1_pred,
             _x0_pred,
-        ) = self.policy.get_cfm_loss(
-            obs, self.transition.actions, cfm_loss_eps, cfm_loss_t
+            _flow_components,
+        ) = self._compute_flow_score(
+            obs,
+            self.transition.actions,
+            cfm_loss_eps,
+            cfm_loss_t,
+            meanflow_loss_r,
         )
 
         self.transition.initial_cfm_loss = self.transition.initial_cfm_loss.detach()
@@ -218,6 +248,7 @@ class FPO:
 
         self.transition.cfm_loss_eps = cfm_loss_eps
         self.transition.cfm_loss_t = cfm_loss_t
+        self.transition.meanflow_loss_r = meanflow_loss_r
 
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
@@ -279,6 +310,8 @@ class FPO:
 
         mean_approx_kl = 0
         mean_clip_fraction = 0
+        mean_flow_score = 0
+        mean_flow_components: dict[str, float] = {}
         # Gradient norm tracking (kept for metrics, not histograms)
         all_grad_norms_before = []
         all_grad_norms_after = []
@@ -306,6 +339,7 @@ class FPO:
             old_cfm_loss_batch,
             old_cfm_loss_eps_batch,
             old_cfm_loss_t_batch,
+            old_meanflow_loss_r_batch,
             hid_states_batch,
             masks_batch,
         ) in generator:
@@ -348,10 +382,21 @@ class FPO:
                 self.n_samples_per_action,
                 1,
             )
+            assert old_meanflow_loss_r_batch.shape == old_cfm_loss_t_batch.shape
 
-            # Use stored samples
-            cfm_loss_batch, x1_pred_batch, x0_pred_batch = self.policy.get_cfm_loss(
-                obs_batch, actions_batch, old_cfm_loss_eps_batch, old_cfm_loss_t_batch
+            # Reuse exactly the Monte-Carlo samples stored during rollout.
+            (
+                cfm_loss_batch,
+                x1_pred_batch,
+                x0_pred_batch,
+                flow_components,
+            ) = self._compute_flow_score(
+                obs_batch,
+                actions_batch,
+                old_cfm_loss_eps_batch,
+                old_cfm_loss_t_batch,
+                old_meanflow_loss_r_batch,
+                return_components=True,
             )
             assert x1_pred_batch.shape == (
                 batch_size,
@@ -550,6 +595,11 @@ class FPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_bonus.item() if entropy_bonus is not None else 0.0
+            mean_flow_score += cfm_loss_batch.detach().mean().item()
+            for name, value in flow_components.items():
+                mean_flow_components[name] = mean_flow_components.get(name, 0.0) + (
+                    value.detach().mean().item()
+                )
 
             mini_batch_step += 1
 
@@ -558,6 +608,9 @@ class FPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_flow_score /= num_updates
+        for name in mean_flow_components:
+            mean_flow_components[name] /= num_updates
         if self.schedule == "adaptive":
             mean_kl /= num_updates
         mean_approx_kl /= num_updates
@@ -594,9 +647,12 @@ class FPO:
             "clip_param": self.clip_param,
             "approx_kl": mean_approx_kl,
             "clip_fraction": mean_clip_fraction,
+            self.flow_score_name: mean_flow_score,
             "explained_variance": explained_variance,
             "action_std": action_std,
         }
+        for name, value in mean_flow_components.items():
+            metrics_dict[f"{self.flow_score_name}/{name}"] = value
         if self.schedule == "adaptive":
             metrics_dict["kl"] = mean_kl
 
@@ -708,3 +764,90 @@ class FPO:
                     all_grads[offset : offset + numel].view_as(param.grad.data)
                 )
                 offset += numel
+
+
+class IMFFPO(FPO):
+    """Experimental FPO variant that replays improved-MeanFlow scores.
+
+    ``exp(old_imf_score - new_imf_score)`` is an engineering surrogate.  The
+    ELBO argument behind the original FPO CFM score does not currently extend
+    to the iMF JVP compound residual, so this class deliberately carries the
+    experimental qualifier in its documentation and TensorBoard metric name.
+    """
+
+    def __init__(
+        self,
+        policy: IMFActorCritic,
+        cfg: FpoRslRlPpoAlgorithmCfg,
+        device="cpu",
+        multi_gpu_cfg: dict | None = None,
+    ):
+        if not isinstance(policy, IMFActorCritic):
+            raise TypeError(
+                "IMFFPO requires policy.class_name='IMFActorCritic'; "
+                f"got {type(policy).__name__}"
+            )
+        # The old FPO adaptive-KL and kNN terms are based on local CFM endpoint
+        # proxies.  They are not a defined mean-flow divergence/entropy, so
+        # require users to opt into a separately designed alternative instead.
+        if cfg.schedule != "fixed":
+            raise ValueError(
+                "IMFFPO currently requires schedule='fixed'; the legacy "
+                "adaptive KL proxy is not defined for mean flows"
+            )
+        if cfg.knn_entropy_coef != 0.0:
+            raise ValueError(
+                "IMFFPO currently requires knn_entropy_coef=0.0; the legacy "
+                "CFM endpoint entropy proxy is not defined for mean flows"
+            )
+        super().__init__(policy, cfg, device=device, multi_gpu_cfg=multi_gpu_cfg)
+        self.flow_score_name = "experimental_imf_score"
+
+    def _sample_flow_score_times(
+        self, num_envs: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample and anchor iMF intervals exactly once per rollout action."""
+        shape = (num_envs, self.n_samples_per_action, 1)
+        mean = self.policy.imf_logit_normal_mean
+        std = self.policy.imf_logit_normal_std
+        first_time = torch.sigmoid(torch.randn(shape, device=self.device) * std + mean)
+        second_time = torch.sigmoid(
+            torch.randn(shape, device=self.device) * std + mean
+        )
+        t = torch.maximum(first_time, second_time)
+        r = torch.minimum(first_time, second_time)
+
+        # iMF uses r=t Flow-Matching samples to anchor the instantaneous-v
+        # auxiliary head.  ``where`` copies the exact same tensor so the
+        # equality can also be logged during update.
+        if self.policy.imf_fm_proportion > 0.0:
+            anchors = torch.rand(shape, device=self.device) < self.policy.imf_fm_proportion
+            r = torch.where(anchors, t, r)
+        return t, r
+
+    def _compute_flow_score(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        eps: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        *,
+        return_components: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if return_components:
+            score, x1_pred, x0_pred, components = self.policy.get_imf_loss(
+                observations,
+                actions,
+                eps,
+                r,
+                t,
+                return_components=True,
+            )
+            components["anchor_fraction"] = torch.isclose(r, t).float()
+            return score, x1_pred, x0_pred, components
+
+        score, x1_pred, x0_pred = self.policy.get_imf_loss(
+            observations, actions, eps, r, t
+        )
+        return score, x1_pred, x0_pred, {}

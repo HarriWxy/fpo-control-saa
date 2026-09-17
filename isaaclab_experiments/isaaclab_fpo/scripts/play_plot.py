@@ -186,8 +186,12 @@ def visualize_action_correlation(trajectories, save_path, checkpoint_name, env_s
     ax.tick_params(which="minor", bottom=False, left=False) # Hide minor ticks from axes
 
     # 6. Finalize the plot and save it
-    title = f"Action Correlation Matrix (Scale: {action_scale:.2f}, Checkpoint: {checkpoint_name}, Env Steps: {env_steps})"
-    # ax.set_title(title, fontsize=14, pad=20)
+    # ax.set_title(
+    #     f"Action Correlation Matrix (Scale: {action_scale:.2f}, "
+    #     f"Checkpoint: {checkpoint_name}, Env Steps: {env_steps})",
+    #     fontsize=14,
+    #     pad=20,
+    # )
     fig.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close(fig)
@@ -301,7 +305,6 @@ def get_marginal_flow_trajectories(policy, observation, sample_noises, device=No
     """
     x_t_all = sample_noises.clone()  # (num_samples, action_dim)
     num_samples = x_t_all.shape[0]
-    action_dim = x_t_all.shape[1]
     trajectories = [[] for _ in range(num_samples)]
 
     def _flow_schedule(flow_steps: int):
@@ -322,16 +325,20 @@ def get_marginal_flow_trajectories(policy, observation, sample_noises, device=No
 
     # Batched flow steps with mini-batching
     for t_curr, t_nxt in zip(t_current, t_next):
-        dt = t_nxt - t_curr
         for start in range(0, num_samples, mini_batch_size):
             end = min(start + mini_batch_size, num_samples)
             batch_idx = slice(start, end)
             x_t = x_t_all[batch_idx]  # (B, action_dim)
             obs_batch = obs[batch_idx]  # (B, obs_dim)
-            embedded_t = policy._embed_timestep(torch.tensor([[t_curr]], device=device)).expand(end - start, -1)
-            mlp_input = torch.cat([obs_batch, embedded_t, x_t], dim=-1)  # (B, obs+embed+action)
-            velocity = policy.actor(mlp_input)  # (B, action_dim)
-            x_t_new = x_t + velocity * dt
+            t_batch = torch.full(
+                (end - start, 1), t_curr.item(), device=device, dtype=x_t.dtype
+            )
+            r_batch = torch.full(
+                (end - start, 1), t_nxt.item(), device=device, dtype=x_t.dtype
+            )
+            # Do not assume a single-timestep CFM actor layout here.  Both
+            # CFM and IMF policies implement this scaled-space reverse step.
+            x_t_new = policy.flow_step(obs_batch, x_t, r_batch, t_batch)
             x_t_all[batch_idx] = x_t_new
             # Store trajectory for each sample in the batch
             for i, idx in enumerate(range(start, end)):
@@ -407,7 +414,11 @@ def main():
 
     # Override the training sample steps if it is not None
     if args_cli.training_sampling_steps is not None and hasattr(agent_cfg.policy, 'training_sampling_steps'):
-        print(f"[INFO] Overriding training sampling steps from {ppo_runner.alg.policy.training_sampling_steps} to {args_cli.training_sampling_steps}")
+        print(
+            "[INFO] Overriding training sampling steps from "
+            f"{agent_cfg.policy.training_sampling_steps} to "
+            f"{args_cli.training_sampling_steps}"
+        )
         agent_cfg.policy.training_sampling_steps = args_cli.training_sampling_steps
     elif hasattr(agent_cfg.policy, 'training_sampling_steps'):
         print(f"[INFO] Using training sampling steps: {agent_cfg.policy.training_sampling_steps}")
@@ -462,7 +473,6 @@ def main():
     sample_noises = torch.randn(max_env_steps, num_samples, policy_nn.num_actions, device=env.unwrapped.device)
 
     obs, _ = env.get_observations()
-    timestep = 0
     env_steps = 0
     joint_angle_first = env.unwrapped.scene["robot"].data.joint_pos.detach().cpu().numpy()
     root_pose_first = env.unwrapped.scene["robot"].data.root_pose_w.detach().cpu().numpy()
