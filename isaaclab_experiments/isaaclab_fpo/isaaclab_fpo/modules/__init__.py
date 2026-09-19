@@ -5,11 +5,12 @@
 
 """Definitions for neural-network components for RL-agents."""
 
-from .actor_critic import ActorCritic, IMFActorCritic
+from .actor_critic import ActorCritic, IMFActorCritic, PMFActorCritic
 from .normalizer import EmpiricalNormalization
 
 __all__ = [
     "ActorCritic",
     "IMFActorCritic",
+    "PMFActorCritic",
     "EmpiricalNormalization",
 ]

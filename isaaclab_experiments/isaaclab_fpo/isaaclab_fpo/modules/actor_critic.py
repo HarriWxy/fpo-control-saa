@@ -635,3 +635,268 @@ class IMFActorCritic(ActorCritic):
             x_t = x_t + mean_velocity * dt[i]
 
         return x_t
+
+
+class PMFActorCritic(ActorCritic):
+    """Pixel Mean Flow actor with the original FPO value critic.
+
+    pMF changes the prediction space compared with iMF: the actor directly
+    predicts two denoised-action-like endpoints (one for ``u`` and one for the
+    auxiliary boundary ``v``).  They are converted to velocity space through
+    ``u=(z_t-x_u)/max(t, eps)`` and ``v=(z_t-x_v)/max(t, eps)`` before the iMF
+    compound JVP residual is formed.  The actor is conditioned on ``h=t-r``
+    only, matching the pMF implementation; the explicit ``t`` dependence is
+    retained in the x-to-velocity conversion.
+    """
+
+    actor_num_time_embeddings = 1
+    actor_output_multiplier = 2
+    is_pixel_mean_flow = True
+
+    def __init__(
+        self,
+        num_actor_obs: int,
+        num_critic_obs: int,
+        num_actions: int,
+        cfg: FpoRslRlPpoActorCriticCfg,
+    ):
+        super().__init__(num_actor_obs, num_critic_obs, num_actions, cfg)
+
+        self.pmf_logit_normal_mean = cfg.pmf_logit_normal_mean
+        self.pmf_logit_normal_std = cfg.pmf_logit_normal_std
+        self.pmf_fm_proportion = cfg.pmf_fm_proportion
+        self.pmf_aux_v_loss_coef = cfg.pmf_aux_v_loss_coef
+        self.pmf_time_eps = cfg.pmf_time_eps
+        self.pmf_adaptive_gradient_norm_p = cfg.pmf_adaptive_gradient_norm_p
+        self.pmf_adaptive_gradient_norm_eps = cfg.pmf_adaptive_gradient_norm_eps
+
+        if self.pmf_logit_normal_std <= 0:
+            raise ValueError("pmf_logit_normal_std must be positive")
+        if not 0.0 <= self.pmf_fm_proportion <= 1.0:
+            raise ValueError("pmf_fm_proportion must be in [0, 1]")
+        if self.pmf_aux_v_loss_coef < 0:
+            raise ValueError("pmf_aux_v_loss_coef must be non-negative")
+        if self.pmf_time_eps <= 0:
+            raise ValueError("pmf_time_eps must be positive")
+        if self.pmf_adaptive_gradient_norm_p < 0:
+            raise ValueError("pmf_adaptive_gradient_norm_p must be non-negative")
+        if self.pmf_adaptive_gradient_norm_eps <= 0:
+            raise ValueError("pmf_adaptive_gradient_norm_eps must be positive")
+
+    def _predict_x_heads(
+        self,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        h: torch.Tensor,
+        actor: torch.nn.Module | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict pMF's mean-flow and instantaneous denoised-action fields."""
+        if actor is None:
+            actor = self.actor
+
+        batch_size = observations.shape[0]
+        assert observations.shape == (batch_size, self.num_actor_obs)
+        assert x_t.shape == (batch_size, self.num_actions)
+        assert h.shape == (batch_size, 1)
+
+        embedded_h = self._embed_timestep(h)
+        output = actor(torch.cat([observations, embedded_h, x_t], dim=-1))
+        output = self.mlp_output_scale * output
+        x_mean, x_instantaneous = output.split(self.num_actions, dim=-1)
+        assert x_mean.shape == x_instantaneous.shape == x_t.shape
+        return x_mean, x_instantaneous
+
+    def _predict_u_and_v(
+        self,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        r: torch.Tensor,
+        t: torch.Tensor,
+        actor: torch.nn.Module | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert pMF x predictions into mean and instantaneous velocities."""
+        x_mean, x_instantaneous = self._predict_x_heads(
+            observations, x_t, t - r, actor=actor
+        )
+        denominator = torch.clamp(t, min=self.pmf_time_eps)
+        mean_velocity = (x_t - x_mean) / denominator
+        instantaneous_velocity = (x_t - x_instantaneous) / denominator
+        return mean_velocity, instantaneous_velocity
+
+    def _with_pmf_gradient_normalization(self, loss: torch.Tensor) -> torch.Tensor:
+        """Apply pMF-style gradient normalization without changing FPO scores."""
+        if self.pmf_adaptive_gradient_norm_p == 0.0:
+            return loss
+
+        denominator = (
+            loss.detach() + self.pmf_adaptive_gradient_norm_eps
+        ).pow(self.pmf_adaptive_gradient_norm_p)
+        normalized_loss = loss / denominator
+        # Straight-through estimator: raw loss in the forward ratio, normalized
+        # gradient during the optimizer update.
+        return loss.detach() + normalized_loss - normalized_loss.detach()
+
+    def get_pmf_loss(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        eps: torch.Tensor,
+        r: torch.Tensor,
+        t: torch.Tensor,
+        actor: torch.nn.Module | None = None,
+        return_components: bool = False,
+    ):
+        """Compute pMF's x-prediction-to-v-space FPO score.
+
+        The network output is ``x`` rather than velocity.  The pMF conversion
+        is applied before constructing
+
+        ``V = u + (t-r) * stopgrad(JVP(u; (v, 0, 1)))``.
+
+        As in the official implementation, the instantaneous auxiliary head is
+        trained at the boundary ``r=t``.  The low-time clamp is also used when
+        forming the conditional target, avoiding an unstable division near
+        ``t=0``.  The combined u/v residual is an experimental FPO score.
+        """
+        if actor is None:
+            actor = self.actor
+
+        batch_size, action_dim = actions.shape
+        assert observations.shape == (batch_size, self.num_actor_obs)
+        assert action_dim == self.num_actions
+
+        n_samples_per_action = eps.shape[1]
+        expected_noise_shape = (batch_size, n_samples_per_action, action_dim)
+        expected_time_shape = (batch_size, n_samples_per_action, 1)
+        assert eps.shape == expected_noise_shape
+        assert r.shape == t.shape == expected_time_shape
+
+        scaled_actions = actions / self.actor_scale
+        x_t = t * eps + (1.0 - t) * scaled_actions[:, None, :]
+        # pMF's x-to-v conversion uses the same lower clamp as its network;
+        # above the clamp this is exactly the CFM target eps - scaled_action.
+        target_velocity = (x_t - scaled_actions[:, None, :]) / torch.clamp(
+            t, min=self.pmf_time_eps
+        )
+
+        flat_size = batch_size * n_samples_per_action
+        flat_observations = (
+            observations[:, None, :]
+            .expand(batch_size, n_samples_per_action, -1)
+            .reshape(flat_size, self.num_actor_obs)
+        )
+        flat_x_t = x_t.reshape(flat_size, action_dim)
+        flat_r = r.reshape(flat_size, 1)
+        flat_t = t.reshape(flat_size, 1)
+        flat_target = target_velocity.reshape(flat_size, action_dim)
+
+        # v_theta is the auxiliary instantaneous field evaluated at h=0.
+        _, instantaneous_velocity = self._predict_u_and_v(
+            flat_observations, flat_x_t, flat_t, flat_t, actor=actor
+        )
+        mean_velocity, _ = self._predict_u_and_v(
+            flat_observations, flat_x_t, flat_r, flat_t, actor=actor
+        )
+
+        def mean_velocity_fn(
+            z_input: torch.Tensor, r_input: torch.Tensor, t_input: torch.Tensor
+        ) -> torch.Tensor:
+            mean_velocity, _ = self._predict_u_and_v(
+                flat_observations, z_input, r_input, t_input, actor=actor
+            )
+            return mean_velocity
+
+        # The pMF/iMF identity differentiates along the trajectory tangent v,
+        # with r held fixed and t increasing.  Stop-gradient is applied to the
+        # JVP output, so this update does not create a second-order parameter
+        # graph.
+        _, mean_velocity_time_derivative = torch.autograd.functional.jvp(
+            mean_velocity_fn,
+            (flat_x_t, flat_r, flat_t),
+            (
+                instantaneous_velocity.detach(),
+                torch.zeros_like(flat_r),
+                torch.ones_like(flat_t),
+            ),
+            create_graph=False,
+        )
+        compound_velocity = mean_velocity + (flat_t - flat_r) * (
+            mean_velocity_time_derivative.detach()
+        )
+
+        pmf_u_loss = self._compute_squared_error(compound_velocity, flat_target)
+        pmf_v_loss = self._compute_squared_error(
+            instantaneous_velocity, flat_target
+        )
+        score = self._with_pmf_gradient_normalization(pmf_u_loss)
+        score = score + self.pmf_aux_v_loss_coef * self._with_pmf_gradient_normalization(
+            pmf_v_loss
+        )
+
+        # Keep the legacy diagnostics/storage contract.  IMFFPO/PMFFPO disable
+        # the old KL/kNN proxies, so these endpoint values are informational.
+        x0_pred = flat_x_t - flat_t * instantaneous_velocity
+        x1_pred = x0_pred + instantaneous_velocity
+
+        score = score.reshape(batch_size, n_samples_per_action)
+        x0_pred = x0_pred.reshape(batch_size, n_samples_per_action, action_dim)
+        x1_pred = x1_pred.reshape(batch_size, n_samples_per_action, action_dim)
+        assert score.shape == (batch_size, n_samples_per_action)
+
+        if return_components:
+            components = {
+                "u_loss": pmf_u_loss.reshape(batch_size, n_samples_per_action),
+                "v_loss": pmf_v_loss.reshape(batch_size, n_samples_per_action),
+                "interval": (flat_t - flat_r).reshape(
+                    batch_size, n_samples_per_action
+                ),
+                "jvp_norm": mean_velocity_time_derivative.detach()
+                .norm(dim=-1)
+                .reshape(batch_size, n_samples_per_action),
+            }
+            return score, x1_pred, x0_pred, components
+        return score, x1_pred, x0_pred
+
+    def flow_step(
+        self,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        r: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Take one pMF mean-flow jump in the scaled action space."""
+        mean_velocity, _ = self._predict_u_and_v(observations, x_t, r, t)
+        return x_t - (t - r) * mean_velocity
+
+    def _integrate_flow(
+        self,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        t_current: torch.Tensor,
+        dt: torch.Tensor,
+        flow_steps: int,
+    ) -> torch.Tensor:
+        """Integrate pMF x-derived mean velocities from t=1 to t=0."""
+        batch_size = observations.shape[0]
+        half_dim = self.timestep_embed_dim // 2
+        freqs = 2 ** torch.arange(
+            half_dim, device=observations.device, dtype=observations.dtype
+        )
+
+        for i in range(flow_steps):
+            t_value = t_current[i].reshape(1, 1)
+            # Reverse integration has dt=r-t<0, so h=t-r=-dt>0.
+            h_value = (-dt[i]).reshape(1, 1)
+            embedded_h = torch.cat(
+                [torch.cos(h_value * freqs), torch.sin(h_value * freqs)], dim=-1
+            ).expand(batch_size, -1)
+            output = self.actor(
+                torch.cat([observations, embedded_h, x_t], dim=-1)
+            )
+            output = self.mlp_output_scale * output
+            x_mean = output[:, : self.num_actions]
+            denominator = torch.clamp(t_value, min=self.pmf_time_eps)
+            mean_velocity = (x_t - x_mean) / denominator
+            x_t = x_t + mean_velocity * dt[i]
+
+        return x_t

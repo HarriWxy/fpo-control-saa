@@ -14,7 +14,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 import isaaclab_fpo
-from isaaclab_fpo.algorithms import FPO, IMFFPO
+from isaaclab_fpo.algorithms import FPO, IMFFPO, PMFFPO
 
 if TYPE_CHECKING:
     from isaaclab_fpo.rl_cfg import FpoRslRlOnPolicyRunnerCfg
@@ -23,6 +23,7 @@ from isaaclab_fpo.modules import (
     ActorCritic,
     EmpiricalNormalization,
     IMFActorCritic,
+    PMFActorCritic,
 )
 from isaaclab_fpo.utils import store_code_state
 
@@ -59,15 +60,17 @@ class OnPolicyRunner:
             num_privileged_obs = num_obs
 
         # ``class_name`` used to be descriptive only.  Keep the legacy names
-        # and make the iMF implementation explicitly selectable so old FPO
+        # and make the mean-flow variants explicitly selectable so old FPO
         # checkpoints retain their original actor layout.
         policy_classes = {
             "ActorCritic": ActorCritic,
             "IMFActorCritic": IMFActorCritic,
+            "PMFActorCritic": PMFActorCritic,
         }
         algorithm_classes = {
             "FPO": FPO,
             "IMFFPO": IMFFPO,
+            "PMFFPO": PMFFPO,
         }
         try:
             policy_class = policy_classes[train_cfg.policy.class_name]
@@ -85,9 +88,14 @@ class OnPolicyRunner:
                 f"{train_cfg.algorithm.class_name!r}; expected one of "
                 f"{sorted(algorithm_classes)}"
             ) from exc
-        if (policy_class is IMFActorCritic) != (algorithm_class is IMFFPO):
+        expected_algorithms = {
+            ActorCritic: FPO,
+            IMFActorCritic: IMFFPO,
+            PMFActorCritic: PMFFPO,
+        }
+        if expected_algorithms[policy_class] is not algorithm_class:
             raise ValueError(
-                "IMFActorCritic and IMFFPO must be selected together; got "
+                "Policy and algorithm variants must be selected together; got "
                 f"policy={train_cfg.policy.class_name!r}, "
                 f"algorithm={train_cfg.algorithm.class_name!r}"
             )

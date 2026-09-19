@@ -8,8 +8,8 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("isaaclab")
 
-from isaaclab_fpo.algorithms import FPO, IMFFPO
-from isaaclab_fpo.modules import ActorCritic, IMFActorCritic
+from isaaclab_fpo.algorithms import FPO, IMFFPO, PMFFPO
+from isaaclab_fpo.modules import ActorCritic, IMFActorCritic, PMFActorCritic
 from isaaclab_fpo.rl_cfg import (
     FpoRslRlPpoActorCriticCfg,
     FpoRslRlPpoAlgorithmCfg,
@@ -181,3 +181,55 @@ def test_imf_boundary_anchor_and_one_nfe_contract():
         observations, eval_mode="fixed_seed", eval_fixed_seed=seed
     )
     assert torch.allclose(expected_action, inferred_action, atol=1.0e-6, rtol=1.0e-5)
+
+
+def test_pmf_x_prediction_replays_and_one_nfe_returns_x_head():
+    """pMF must train in v-space while one NFE directly returns its x head."""
+    policy = PMFActorCritic(3, 3, 2, make_policy_cfg())
+    algorithm = PMFFPO(policy, make_algorithm_cfg("PMFFPO"), device="cpu")
+    sampled_t, sampled_r = algorithm._sample_flow_score_times(num_envs=2)
+    assert torch.all(sampled_r <= sampled_t)
+    anchor_fraction = torch.isclose(sampled_r, sampled_t).float().mean()
+    assert torch.isclose(anchor_fraction, torch.tensor(0.5))
+
+    observations = torch.randn(2, 3)
+    actions = torch.randn(2, 2)
+    eps = torch.randn(2, 2, 2)
+    t = torch.tensor([[[0.8], [0.6]], [[0.7], [0.9]]])
+    r = torch.tensor([[[0.2], [0.6]], [[0.1], [0.4]]])
+
+    score, _, _, components = policy.get_pmf_loss(
+        observations, actions, eps, r, t, return_components=True
+    )
+    assert score.shape == (2, 2)
+    assert all(torch.isfinite(value).all() for value in components.values())
+    score.mean().backward()
+    final_weight_grad = policy.actor[-1].weight.grad
+    assert final_weight_grad is not None
+    assert final_weight_grad[: policy.num_actions].abs().sum() > 0
+    assert final_weight_grad[policy.num_actions :].abs().sum() > 0
+
+    policy.eval()
+    noise = torch.randn(2, 2)
+    x_mean, _ = policy._predict_x_heads(
+        observations, noise, torch.ones(2, 1)
+    )
+    one_nfe_scaled = policy.flow_step(
+        observations, noise, torch.zeros(2, 1), torch.ones(2, 1)
+    )
+    assert torch.allclose(one_nfe_scaled, x_mean, atol=1.0e-6, rtol=1.0e-5)
+
+
+def test_pmf_fpo_update_is_finite():
+    """The pMF score must satisfy the same rollout/update storage contract."""
+    policy = PMFActorCritic(3, 3, 2, make_policy_cfg())
+    algorithm = PMFFPO(policy, make_algorithm_cfg("PMFFPO"), device="cpu")
+    collect_two_steps(algorithm)
+    result = algorithm.update()
+
+    assert torch.isfinite(torch.tensor(result["surrogate_loss"]))
+    assert torch.isfinite(
+        torch.tensor(result["metrics"]["experimental_pmf_score"])
+    )
+    assert "experimental_pmf_score/u_loss" in result["metrics"]
+    assert "experimental_pmf_score/v_loss" in result["metrics"]

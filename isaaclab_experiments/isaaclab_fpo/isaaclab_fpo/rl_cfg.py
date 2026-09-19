@@ -20,7 +20,7 @@ class FpoRslRlPpoActorCriticCfg:
     """Configuration for the PPO actor-critic networks."""
 
     class_name: str = "ActorCritic"
-    """The policy class name (``ActorCritic`` or ``IMFActorCritic``)."""
+    """The policy class name (``ActorCritic``, ``IMFActorCritic`` or ``PMFActorCritic``)."""
 
     init_noise_std: float = 1.0
     """The initial noise standard deviation for the policy."""
@@ -139,6 +139,38 @@ class FpoRslRlPpoActorCriticCfg:
     imf_adaptive_gradient_norm_eps: float = 0.01
     """Numerical epsilon for iMF adaptive gradient normalization."""
 
+    # Pixel Mean Flow (pMF) parameters.  These are separate from iMF because
+    # pMF changes the prediction space: the network emits denoised-action-like
+    # x predictions, which are converted to u/v in velocity space.
+    pmf_logit_normal_mean: float = -0.4
+    """Location of the logit-normal distribution used to sample pMF times."""
+
+    pmf_logit_normal_std: float = 1.0
+    """Scale of the logit-normal distribution used for pMF time sampling."""
+
+    pmf_fm_proportion: float = 0.5
+    """Probability of replacing pMF's lower endpoint ``r`` with ``t``.
+
+    The resulting zero-length intervals provide the Flow-Matching boundary
+    samples used to train pMF's auxiliary instantaneous-velocity x head.
+    """
+
+    pmf_aux_v_loss_coef: float = 1.0
+    """Weight of pMF's auxiliary instantaneous-velocity loss."""
+
+    pmf_time_eps: float = 0.05
+    """Lower clamp used when converting x predictions to velocity predictions."""
+
+    pmf_adaptive_gradient_norm_p: float = 0.0
+    """Optional pMF adaptive gradient-normalization exponent.
+
+    The raw pMF residual remains the FPO ratio score in the forward pass;
+    values above zero apply normalization through a straight-through gradient.
+    """
+
+    pmf_adaptive_gradient_norm_eps: float = 0.01
+    """Numerical epsilon for pMF adaptive gradient normalization."""
+
 
 ############################
 # Algorithm configurations #
@@ -150,7 +182,7 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     """Configuration for the FPO (Flow Policy Optimization) algorithm."""
 
     class_name: str = "FPO"
-    """The algorithm class name (``FPO`` or experimental ``IMFFPO``)."""
+    """The algorithm class name (``FPO``, experimental ``IMFFPO`` or ``PMFFPO``)."""
 
     num_learning_epochs: int = 16
     """The number of learning epochs per update. Default is 16.

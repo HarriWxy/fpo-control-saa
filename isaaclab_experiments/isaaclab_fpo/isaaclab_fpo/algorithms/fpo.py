@@ -12,7 +12,7 @@ import torch.optim as optim
 
 from typing import TYPE_CHECKING
 
-from isaaclab_fpo.modules import ActorCritic, IMFActorCritic
+from isaaclab_fpo.modules import ActorCritic, IMFActorCritic, PMFActorCritic
 from isaaclab_fpo.modules.ema import ExponentialMovingAverage
 from isaaclab_fpo.storage import RolloutStorage
 
@@ -848,6 +848,98 @@ class IMFFPO(FPO):
             return score, x1_pred, x0_pred, components
 
         score, x1_pred, x0_pred = self.policy.get_imf_loss(
+            observations, actions, eps, r, t
+        )
+        return score, x1_pred, x0_pred, {}
+
+
+class PMFFPO(FPO):
+    """Experimental FPO variant using pMF's x-prediction parameterization.
+
+    The policy score is computed in velocity space after converting the two
+    pMF x heads to ``u`` and the boundary ``v`` field.  As with ``IMFFPO``,
+    exponentiating this compound residual is an engineering surrogate rather
+    than a new likelihood-ratio derivation.
+    """
+
+    def __init__(
+        self,
+        policy: PMFActorCritic,
+        cfg: FpoRslRlPpoAlgorithmCfg,
+        device="cpu",
+        multi_gpu_cfg: dict | None = None,
+    ):
+        if not isinstance(policy, PMFActorCritic):
+            raise TypeError(
+                "PMFFPO requires policy.class_name='PMFActorCritic'; "
+                f"got {type(policy).__name__}"
+            )
+        if cfg.schedule != "fixed":
+            raise ValueError(
+                "PMFFPO currently requires schedule='fixed'; the legacy "
+                "adaptive KL proxy is not defined for pixel mean flows"
+            )
+        if cfg.knn_entropy_coef != 0.0:
+            raise ValueError(
+                "PMFFPO currently requires knn_entropy_coef=0.0; the legacy "
+                "CFM endpoint entropy proxy is not defined for pixel mean flows"
+            )
+        super().__init__(policy, cfg, device=device, multi_gpu_cfg=multi_gpu_cfg)
+        self.flow_score_name = "experimental_pmf_score"
+
+    def _sample_flow_score_times(
+        self, num_envs: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample pMF logit-normal intervals and boundary FM anchors."""
+        shape = (num_envs, self.n_samples_per_action, 1)
+        mean = self.policy.pmf_logit_normal_mean
+        std = self.policy.pmf_logit_normal_std
+        first_time = torch.sigmoid(torch.randn(shape, device=self.device) * std + mean)
+        second_time = torch.sigmoid(torch.randn(shape, device=self.device) * std + mean)
+
+        # pMF uses a data/FM proportion to guarantee enough r=t boundary
+        # samples for the auxiliary instantaneous x head.  Select a
+        # deterministic prefix of the flattened rollout so the requested
+        # proportion is not lost to Bernoulli variance at small MC counts.
+        num_anchors = int(
+            shape[0] * shape[1] * self.policy.pmf_fm_proportion
+        )
+        if num_anchors > 0:
+            anchor_index = torch.arange(
+                shape[0] * shape[1], device=self.device
+            ).reshape(shape[0], shape[1], 1)
+            anchors = anchor_index < num_anchors
+            # Apply the anchor before ordering, matching the official pMF
+            # sampler: an anchor uses one logit-normal draw for both ends.
+            second_time = torch.where(anchors, first_time, second_time)
+
+        t = torch.maximum(first_time, second_time)
+        r = torch.minimum(first_time, second_time)
+        return t, r
+
+    def _compute_flow_score(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        eps: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        *,
+        return_components: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if return_components:
+            score, x1_pred, x0_pred, components = self.policy.get_pmf_loss(
+                observations,
+                actions,
+                eps,
+                r,
+                t,
+                return_components=True,
+            )
+            components["anchor_fraction"] = torch.isclose(r, t).float()
+            return score, x1_pred, x0_pred, components
+
+        score, x1_pred, x0_pred = self.policy.get_pmf_loss(
             observations, actions, eps, r, t
         )
         return score, x1_pred, x0_pred, {}
