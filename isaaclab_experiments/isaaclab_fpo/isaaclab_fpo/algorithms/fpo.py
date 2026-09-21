@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import copy
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -111,6 +113,34 @@ class FPO:
         self.trust_region_mode = cfg.trust_region_mode
         self.update_counter = 0
         self.flow_score_name = "cfm_score"
+        self.policy_regularization_name: str | None = None
+
+    def _prepare_update(self) -> None:
+        """Prepare variant-specific state before the first optimization step."""
+
+    def _compute_policy_regularization(
+        self,
+        observations: torch.Tensor,
+        flow_noise: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return an optional scalar policy regularizer and its diagnostics."""
+        del flow_noise
+        return observations.new_zeros(()), {}
+
+    def _compute_importance_ratio(
+        self,
+        old_flow_score: torch.Tensor,
+        current_flow_score: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute FPO's score-ratio surrogate with the update direction intact."""
+        if old_flow_score.shape != current_flow_score.shape:
+            raise ValueError(
+                "old and current flow scores must have identical shapes; got "
+                f"{tuple(old_flow_score.shape)} and {tuple(current_flow_score.shape)}"
+            )
+        raw_log_ratio = old_flow_score - current_flow_score
+        log_ratio = clamp_ste(raw_log_ratio, max=self.cfm_diff_clamp_max)
+        return raw_log_ratio, torch.exp(log_ratio)
 
     def init_storage(
         self,
@@ -196,12 +226,13 @@ class FPO:
             f"Expected values shape [{self.storage.num_envs}, 1], got {self.transition.values.shape}"
         )
 
-        # Flow-score samples.  CFM uses only ``t``; IMF-FPO additionally
-        # records its lower interval endpoint ``r`` for exact replay.
         cfm_loss_eps = torch.randn(
             (self.storage.num_envs, self.n_samples_per_action, self.policy.num_actions),
             device=self.device,
         )
+
+        # Flow-score samples.  CFM uses only ``t``; IMF-FPO additionally
+        # records its lower interval endpoint ``r`` for exact replay.
         cfm_loss_t, meanflow_loss_r = self._sample_flow_score_times(
             self.storage.num_envs
         )
@@ -303,10 +334,17 @@ class FPO:
 
     def update(self, obs_normalizer=None, privileged_obs_normalizer=None):  # noqa: C901
         '''Update the policy using the collected experience.'''
+        # Variant-specific old-policy snapshots must be captured before the
+        # first optimizer step and remain fixed across all epochs.
+        self._prepare_update()
+
         mean_value_loss = 0
         mean_surrogate_loss = 0
+        mean_total_loss = 0
         mean_entropy = 0
         mean_kl = 0
+        mean_policy_regularization = 0
+        mean_policy_regularization_components: dict[str, float] = {}
 
         mean_approx_kl = 0
         mean_clip_fraction = 0
@@ -490,9 +528,10 @@ class FPO:
 
             # Per-sample log ratios (no averaging before exp)
             # Each of the n_samples gets its own ratio, providing more gradient diversity
-            raw_log_ratio = old_cfm_loss_batch - cfm_loss_batch
-            log_ratio = clamp_ste(raw_log_ratio, max=self.cfm_diff_clamp_max)
-            ratio = torch.exp(log_ratio)
+            raw_log_ratio, ratio = self._compute_importance_ratio(
+                old_cfm_loss_batch,
+                cfm_loss_batch,
+            )
             assert ratio.shape == (
                 batch_size,
                 self.n_samples_per_action,
@@ -544,6 +583,14 @@ class FPO:
             else:
                 raise ValueError(f"Unknown trust_region_mode: {self.trust_region_mode}")
 
+            policy_regularization, policy_regularization_components = (
+                self._compute_policy_regularization(
+                    obs_batch,
+                    old_cfm_loss_eps_batch,
+                )
+            )
+            assert policy_regularization.ndim == 0
+
             # Value function loss
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (
@@ -555,7 +602,11 @@ class FPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss
+            loss = (
+                surrogate_loss
+                + self.value_loss_coef * value_loss
+                + policy_regularization
+            )
             if entropy_bonus is not None:
                 loss -= self.knn_entropy_coef * entropy_bonus
 
@@ -594,8 +645,15 @@ class FPO:
             # Store the losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
+            mean_total_loss += loss.detach().item()
             mean_entropy += entropy_bonus.item() if entropy_bonus is not None else 0.0
             mean_flow_score += cfm_loss_batch.detach().mean().item()
+            mean_policy_regularization += policy_regularization.detach().item()
+            for name, value in policy_regularization_components.items():
+                mean_policy_regularization_components[name] = (
+                    mean_policy_regularization_components.get(name, 0.0)
+                    + value.detach().mean().item()
+                )
             for name, value in flow_components.items():
                 mean_flow_components[name] = mean_flow_components.get(name, 0.0) + (
                     value.detach().mean().item()
@@ -607,8 +665,12 @@ class FPO:
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        mean_total_loss /= num_updates
         mean_entropy /= num_updates
         mean_flow_score /= num_updates
+        mean_policy_regularization /= num_updates
+        for name in mean_policy_regularization_components:
+            mean_policy_regularization_components[name] /= num_updates
         for name in mean_flow_components:
             mean_flow_components[name] /= num_updates
         if self.schedule == "adaptive":
@@ -638,9 +700,14 @@ class FPO:
         loss_dict = {
             "surrogate_loss": mean_surrogate_loss,
             "value_loss": mean_value_loss,
+            "total_loss": mean_total_loss,
         }
         if self.knn_entropy_coef > 0:
             loss_dict["entropy_loss"] = mean_entropy
+        if self.policy_regularization_name is not None:
+            loss_dict[f"{self.policy_regularization_name}_loss"] = (
+                mean_policy_regularization
+            )
 
         # construct the metrics dictionary (non-loss metrics)
         metrics_dict = {
@@ -653,6 +720,9 @@ class FPO:
         }
         for name, value in mean_flow_components.items():
             metrics_dict[f"{self.flow_score_name}/{name}"] = value
+        if self.policy_regularization_name is not None:
+            for name, value in mean_policy_regularization_components.items():
+                metrics_dict[f"{self.policy_regularization_name}/{name}"] = value
         if self.schedule == "adaptive":
             metrics_dict["kl"] = mean_kl
 
@@ -943,3 +1013,121 @@ class PMFFPO(FPO):
             observations, actions, eps, r, t
         )
         return score, x1_pred, x0_pred, {}
+
+
+class FSPPO(PMFFPO):
+    """Flow-Space PPO with an explicit same-noise transport-map penalty.
+
+    This practical pMF/FPO variant keeps the replayed pMF score ratio used by
+    :class:`PMFFPO`, but additionally penalizes
+
+    ``E[||F_theta(s, eps) - F_old(s, eps)||_2^2]``.
+
+    The old and current maps receive exactly the same rollout-stored base noise.
+    Their coupling therefore upper-bounds the squared Wasserstein-2 distance
+    between the induced action distributions.  This class implements the fixed
+    penalty form from the FSPPO draft; it does not claim that the experimental
+    pMF score ratio itself is an exact likelihood ratio or that a monotonic
+    improvement theorem holds without the draft's additional assumptions.
+    """
+
+    def __init__(
+        self,
+        policy: PMFActorCritic,
+        cfg: FpoRslRlPpoAlgorithmCfg,
+        device="cpu",
+        multi_gpu_cfg: dict | None = None,
+    ):
+        if not isinstance(policy, PMFActorCritic):
+            raise TypeError(
+                "FSPPO requires policy.class_name='PMFActorCritic'; "
+                f"got {type(policy).__name__}"
+            )
+        if policy.sampling_steps != 1:
+            raise ValueError(
+                "FSPPO requires sampling_steps=1 so the pMF x head is the "
+                "actual noise-to-action transport map"
+            )
+        if not math.isfinite(policy.actor_scale) or policy.actor_scale <= 0.0:
+            raise ValueError("FSPPO requires a finite, positive actor_scale")
+        if not math.isfinite(cfg.fsppo_map_loss_coef):
+            raise ValueError("fsppo_map_loss_coef must be finite")
+        if cfg.fsppo_map_loss_coef < 0.0:
+            raise ValueError("fsppo_map_loss_coef must be non-negative")
+
+        super().__init__(policy, cfg, device=device, multi_gpu_cfg=multi_gpu_cfg)
+
+        if self.n_samples_per_action < 1:
+            raise ValueError("FSPPO requires n_samples_per_action >= 1")
+        map_num_samples = cfg.fsppo_map_num_samples
+        if map_num_samples is not None:
+            if isinstance(map_num_samples, bool) or not isinstance(
+                map_num_samples, int
+            ):
+                raise TypeError("fsppo_map_num_samples must be an integer or None")
+            if not 1 <= map_num_samples <= self.n_samples_per_action:
+                raise ValueError(
+                    "fsppo_map_num_samples must be in "
+                    f"[1, n_samples_per_action={self.n_samples_per_action}]"
+                )
+
+        self.fsppo_map_loss_coef = cfg.fsppo_map_loss_coef
+        self.fsppo_map_num_samples = map_num_samples
+        self.flow_score_name = "experimental_fsppo_pmf_score"
+        self.policy_regularization_name = "map_trust_region"
+
+        # FPO is not an nn.Module, so this frozen module is not registered in
+        # the policy, optimizer, EMA, or checkpoint.  It is refreshed from the
+        # online rollout policy at the beginning of every update.
+        self._old_actor = copy.deepcopy(self.policy.actor).to(self.device)
+        self._old_actor.requires_grad_(False)
+        self._old_actor.eval()
+
+    @torch.no_grad()
+    def _prepare_update(self) -> None:
+        """Freeze the rollout policy once for all update epochs/minibatches."""
+        self._old_actor.load_state_dict(self.policy.actor.state_dict())
+        self._old_actor.eval()
+
+    def _compute_policy_regularization(
+        self,
+        observations: torch.Tensor,
+        flow_noise: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Estimate the same-noise terminal-map trust-region penalty."""
+        num_samples = self.fsppo_map_num_samples or flow_noise.shape[1]
+        if (
+            flow_noise.ndim != 3
+            or flow_noise.shape[0] != observations.shape[0]
+            or flow_noise.shape[-1] != self.policy.num_actions
+            or flow_noise.shape[1] < num_samples
+        ):
+            raise ValueError(
+                "flow_noise must contain the configured map samples with shape "
+                "[batch, samples, action_dim]; got "
+                f"{tuple(flow_noise.shape)}, requested samples={num_samples}"
+            )
+        map_noise = flow_noise[:, :num_samples]
+
+        current_actions = self.policy.transport_actions(observations, map_noise)
+        with torch.no_grad():
+            old_actions = self.policy.transport_actions(
+                observations,
+                map_noise,
+                actor=self._old_actor,
+            )
+
+        action_delta = current_actions - old_actions
+        squared_l2 = action_delta.square().sum(dim=-1)
+        map_distance = squared_l2.mean()
+        map_distance_per_action_dim = action_delta.square().mean()
+        regularization = self.fsppo_map_loss_coef * map_distance
+
+        diagnostics = {
+            "distance": map_distance,
+            "distance_per_action_dim": map_distance_per_action_dim,
+            "sqrt_distance": torch.sqrt(map_distance.clamp_min(0.0)),
+            "loss_coefficient": map_distance.new_tensor(self.fsppo_map_loss_coef),
+            "samples_per_action": map_distance.new_tensor(float(num_samples)),
+        }
+        return regularization, diagnostics

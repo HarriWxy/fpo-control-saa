@@ -23,6 +23,26 @@ This creates a conda environment named `isaaclab_fpo`.
 
 All FPO++ training is launched via `isaaclab_fpo/scripts/train.py`. Per-task hyperparameters are defined in `isaaclab_fpo/isaaclab_fpo/task_cfgs.py`.
 
+### Experimental Flow Variants
+
+The legacy FPO++ path remains the default.  MeanFlow variants are selected
+explicitly with `--algorithm imf_fpo`, `--algorithm pmf_fpo`, or
+`--algorithm fsppo`.  FSPPO uses the pMF one-NFE actor and augments its FPO
+surrogate with a same-noise terminal transport-map penalty:
+
+```bash
+python isaaclab_fpo/scripts/train.py \
+    --task Isaac-Velocity-Flat-Unitree-Go2-v0 --headless \
+    --algorithm fsppo \
+    agent.algorithm.fsppo_map_loss_coef=1.0 \
+    agent.algorithm.fsppo_map_num_samples=8
+```
+
+`fsppo_map_num_samples=None` (the default) reuses every stored pMF score-noise
+sample.  The implementation logs the squared map distance under
+`Metrics/map_trust_region/distance`; it is an experimental penalty
+instantiation, not by itself a claim of monotonic policy improvement.
+
 ### Velocity-Conditioned Locomotion
 
 ```bash

@@ -1,6 +1,9 @@
-"""Focused CPU contracts for the experimental Improved MeanFlow FPO path."""
+"""Focused CPU contracts for FPO and its experimental MeanFlow variants."""
 
 from __future__ import annotations
+
+import argparse
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,12 +11,15 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("isaaclab")
 
-from isaaclab_fpo.algorithms import FPO, IMFFPO, PMFFPO
+from isaaclab_fpo.algorithms import FPO, FSPPO, IMFFPO, PMFFPO
+from isaaclab_fpo.cli_args import update_fpo_cfg
 from isaaclab_fpo.modules import ActorCritic, IMFActorCritic, PMFActorCritic
 from isaaclab_fpo.rl_cfg import (
     FpoRslRlPpoActorCriticCfg,
     FpoRslRlPpoAlgorithmCfg,
+    FpoRslRlOnPolicyRunnerCfg,
 )
+from isaaclab_fpo.runners import OnPolicyRunner
 
 
 @pytest.fixture(autouse=True)
@@ -81,6 +87,23 @@ def test_legacy_fpo_still_updates_after_meanflow_storage_extension():
 
     assert torch.isfinite(torch.tensor(result["surrogate_loss"]))
     assert torch.isfinite(torch.tensor(result["metrics"]["cfm_score"]))
+
+
+def test_fpo_score_ratio_sign_and_identity():
+    """A lower current loss must increase support for the sampled action."""
+    policy = ActorCritic(3, 3, 2, make_policy_cfg())
+    algorithm = FPO(policy, make_algorithm_cfg("FPO"), device="cpu")
+    old_score = torch.tensor([[1.0, 1.0, 1.0]])
+    current_score = torch.tensor([[0.75, 1.0, 1.25]])
+
+    raw_log_ratio, ratio = algorithm._compute_importance_ratio(
+        old_score, current_score
+    )
+
+    assert torch.allclose(raw_log_ratio, torch.tensor([[0.25, 0.0, -0.25]]))
+    assert ratio[0, 0] > 1.0
+    assert ratio[0, 1] == 1.0
+    assert ratio[0, 2] < 1.0
 
 
 def test_imf_score_replays_and_update_is_finite():
@@ -233,3 +256,154 @@ def test_pmf_fpo_update_is_finite():
     )
     assert "experimental_pmf_score/u_loss" in result["metrics"]
     assert "experimental_pmf_score/v_loss" in result["metrics"]
+
+
+def test_fsppo_same_noise_map_penalty_uses_frozen_rollout_actor():
+    """D_map is zero at the snapshot and reacts only through the online map."""
+    torch.manual_seed(7)
+    policy = PMFActorCritic(3, 3, 2, make_policy_cfg())
+    cfg = make_algorithm_cfg("FSPPO")
+    cfg.fsppo_map_loss_coef = 2.0
+    cfg.fsppo_map_num_samples = 1
+    algorithm = FSPPO(policy, cfg, device="cpu")
+    algorithm._prepare_update()
+
+    observations = torch.randn(3, 3)
+    noise = torch.randn(3, 2, 2)
+    with torch.no_grad():
+        frozen_actions_before = policy.transport_actions(
+            observations, noise[:, :1], actor=algorithm._old_actor
+        ).clone()
+
+    regularization, diagnostics = algorithm._compute_policy_regularization(
+        observations, noise
+    )
+    assert torch.equal(regularization, torch.zeros_like(regularization))
+    assert torch.equal(
+        diagnostics["distance"], torch.zeros_like(diagnostics["distance"])
+    )
+
+    # Moving only pMF's terminal x-mean bias by 0.2 changes each public action
+    # by actor_scale * 0.2 = 0.1, while the frozen rollout actor stays fixed.
+    with torch.no_grad():
+        policy.actor[-1].bias[: policy.num_actions].add_(0.2)
+
+    with torch.no_grad():
+        frozen_actions_after = policy.transport_actions(
+            observations, noise[:, :1], actor=algorithm._old_actor
+        )
+    assert torch.equal(frozen_actions_before, frozen_actions_after)
+
+    regularization, diagnostics = algorithm._compute_policy_regularization(
+        observations, noise
+    )
+    expected_distance = torch.tensor(2 * (policy.actor_scale * 0.2) ** 2)
+    assert torch.allclose(diagnostics["distance"], expected_distance)
+    assert torch.allclose(regularization, 2.0 * expected_distance)
+
+    algorithm.optimizer.zero_grad()
+    regularization.backward()
+    assert policy.actor[-1].bias.grad[: policy.num_actions].abs().sum() > 0
+    assert policy.actor[-1].bias.grad[policy.num_actions :].abs().sum() == 0
+    assert all(
+        parameter.grad is None for parameter in algorithm._old_actor.parameters()
+    )
+
+    algorithm.fsppo_map_loss_coef = 0.0
+    zero_regularization, zero_coef_diagnostics = (
+        algorithm._compute_policy_regularization(observations, noise)
+    )
+    assert torch.equal(zero_regularization, torch.zeros_like(zero_regularization))
+    assert zero_coef_diagnostics["distance"] > 0
+
+
+def test_fsppo_update_is_finite_and_reports_map_trust_region():
+    """The new regularizer participates in the full PMF rollout/update path."""
+    policy = PMFActorCritic(3, 3, 2, make_policy_cfg())
+    cfg = make_algorithm_cfg("FSPPO")
+    cfg.num_learning_epochs = 2
+    cfg.fsppo_map_num_samples = 1
+    algorithm = FSPPO(policy, cfg, device="cpu")
+
+    collect_two_steps(algorithm)
+    result = algorithm.update()
+
+    assert torch.isfinite(torch.tensor(result["total_loss"]))
+    assert torch.isfinite(torch.tensor(result["map_trust_region_loss"]))
+    assert "experimental_fsppo_pmf_score/u_loss" in result["metrics"]
+    assert "map_trust_region/distance" in result["metrics"]
+    assert "map_trust_region/distance_per_action_dim" in result["metrics"]
+    assert result["metrics"]["map_trust_region/samples_per_action"] == 1.0
+
+
+def test_fsppo_requires_the_one_nfe_pmf_transport_map():
+    """The terminal x head is not the deployed map for multi-step sampling."""
+    policy_cfg = make_policy_cfg()
+    policy_cfg.sampling_steps = 2
+    policy = PMFActorCritic(3, 3, 2, policy_cfg)
+
+    with pytest.raises(ValueError, match="sampling_steps=1"):
+        FSPPO(policy, make_algorithm_cfg("FSPPO"), device="cpu")
+
+
+def test_fsppo_cli_selects_pmf_policy_and_safe_defaults():
+    """The standalone selector must not mutate the legacy FPO/PMF choices."""
+    agent_cfg = SimpleNamespace(
+        seed=42,
+        resume=False,
+        load_run=".*",
+        load_checkpoint="model_.*.pt",
+        run_name="",
+        experiment_name="unit_test",
+        logger="tensorboard",
+        policy=SimpleNamespace(class_name="ActorCritic", sampling_steps=64),
+        algorithm=SimpleNamespace(
+            class_name="FPO", schedule="adaptive", knn_entropy_coef=0.1
+        ),
+    )
+    args = argparse.Namespace(
+        seed=None,
+        resume=None,
+        load_run=None,
+        checkpoint=None,
+        run_name=None,
+        experiment_name=None,
+        logger=None,
+        log_project_name=None,
+        algorithm="fsppo",
+    )
+
+    updated = update_fpo_cfg(agent_cfg, args)
+
+    assert updated.policy.class_name == "PMFActorCritic"
+    assert updated.algorithm.class_name == "FSPPO"
+    assert updated.policy.sampling_steps == 1
+    assert updated.algorithm.schedule == "fixed"
+    assert updated.algorithm.knn_entropy_coef == 0.0
+    assert updated.experiment_name == "unit_test_fsppo"
+
+
+def test_runner_accepts_only_valid_fsppo_policy_pair():
+    """FSPPO shares PMFActorCritic without weakening other pair checks."""
+
+    class FakeEnv:
+        num_actions = 2
+        num_envs = 2
+
+        def get_observations(self):
+            return torch.zeros(self.num_envs, 3), {"observations": {}}
+
+    policy_cfg = make_policy_cfg()
+    policy_cfg.class_name = "PMFActorCritic"
+    runner_cfg = FpoRslRlOnPolicyRunnerCfg(
+        policy=policy_cfg,
+        algorithm=make_algorithm_cfg("FSPPO"),
+        experiment_name="unit_test",
+        num_steps_per_env=2,
+    )
+    runner = OnPolicyRunner(FakeEnv(), runner_cfg, device="cpu")
+    assert isinstance(runner.alg, FSPPO)
+
+    runner_cfg.policy.class_name = "ActorCritic"
+    with pytest.raises(ValueError, match="must be selected together"):
+        OnPolicyRunner(FakeEnv(), runner_cfg, device="cpu")

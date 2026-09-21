@@ -706,6 +706,66 @@ class PMFActorCritic(ActorCritic):
         assert x_mean.shape == x_instantaneous.shape == x_t.shape
         return x_mean, x_instantaneous
 
+    def transport_actions(
+        self,
+        observations: torch.Tensor,
+        noise: torch.Tensor,
+        actor: torch.nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Evaluate the one-NFE pMF transport map with prescribed noise.
+
+        The returned tensor is in the public (scaled) action coordinates used
+        by the environment.  Supplying the same ``noise`` to two actors thus
+        gives the explicit coupling used by FSPPO's map-space trust region.
+
+        Args:
+            observations: Policy observations with shape ``[batch, obs_dim]``.
+            noise: Base samples with shape ``[batch, action_dim]`` or
+                ``[batch, samples, action_dim]``.
+            actor: Optional actor module, used to evaluate a frozen old policy.
+
+        Returns:
+            Transported actions with the same leading dimensions as ``noise``.
+        """
+        batch_size = observations.shape[0]
+        assert observations.shape == (batch_size, self.num_actor_obs)
+        if noise.ndim not in (2, 3):
+            raise ValueError(
+                "noise must have shape [batch, action_dim] or "
+                f"[batch, samples, action_dim], got {tuple(noise.shape)}"
+            )
+        if noise.shape[0] != batch_size or noise.shape[-1] != self.num_actions:
+            raise ValueError(
+                "noise batch/action dimensions must match observations and policy; "
+                f"got observations={tuple(observations.shape)}, noise={tuple(noise.shape)}"
+            )
+
+        if noise.ndim == 2:
+            flat_observations = observations
+            flat_noise = noise
+        else:
+            num_samples = noise.shape[1]
+            flat_observations = (
+                observations[:, None, :]
+                .expand(batch_size, num_samples, -1)
+                .reshape(batch_size * num_samples, self.num_actor_obs)
+            )
+            flat_noise = noise.reshape(batch_size * num_samples, self.num_actions)
+
+        # A pMF jump from t=1 to r=0 has h=t-r=1 and returns the x-mean head
+        # exactly.  Apply actor_scale here so D_map is measured in the same
+        # coordinates as the action delivered by ``act``/``act_inference``.
+        interval = torch.ones(
+            (flat_noise.shape[0], 1),
+            device=flat_noise.device,
+            dtype=flat_noise.dtype,
+        )
+        transported, _ = self._predict_x_heads(
+            flat_observations, flat_noise, interval, actor=actor
+        )
+        transported = self.actor_scale * transported
+        return transported.reshape(*noise.shape[:-1], self.num_actions)
+
     def _predict_u_and_v(
         self,
         observations: torch.Tensor,

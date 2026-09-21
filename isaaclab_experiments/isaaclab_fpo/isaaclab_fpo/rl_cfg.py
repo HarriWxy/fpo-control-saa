@@ -182,7 +182,7 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     """Configuration for the FPO (Flow Policy Optimization) algorithm."""
 
     class_name: str = "FPO"
-    """The algorithm class name (``FPO``, experimental ``IMFFPO`` or ``PMFFPO``)."""
+    """Algorithm class name (``FPO``, ``IMFFPO``, ``PMFFPO`` or ``FSPPO``)."""
 
     num_learning_epochs: int = 16
     """The number of learning epochs per update. Default is 16.
@@ -346,6 +346,23 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     in the actor, this noise affects the policy gradient computation.
 
     Typical values: 0.01-0.05 depending on action scale and desired regularization strength.
+    """
+
+    fsppo_map_loss_coef: float = 1.0
+    """Coefficient of FSPPO's terminal transport-map penalty.
+
+    FSPPO adds ``coef * E[||F_new(s, eps) - F_old(s, eps)||_2^2]`` to the
+    minimized loss.  Both maps use the same stored base noise and the distance
+    is measured after ``actor_scale`` in public action coordinates.  This field
+    is ignored by the other algorithm variants.
+    """
+
+    fsppo_map_num_samples: int | None = None
+    """Number of stored flow-noise samples used by the FSPPO map penalty.
+
+    ``None`` reuses all ``n_samples_per_action`` samples.  A smaller positive
+    value reduces the two extra actor forwards per minibatch without changing
+    the pMF score-ratio samples used by the policy surrogate.
     """
 
     ema_decay: float = 0.95

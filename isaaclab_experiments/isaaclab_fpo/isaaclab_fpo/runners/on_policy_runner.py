@@ -14,7 +14,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 import isaaclab_fpo
-from isaaclab_fpo.algorithms import FPO, IMFFPO, PMFFPO
+from isaaclab_fpo.algorithms import FPO, FSPPO, IMFFPO, PMFFPO
 
 if TYPE_CHECKING:
     from isaaclab_fpo.rl_cfg import FpoRslRlOnPolicyRunnerCfg
@@ -69,6 +69,7 @@ class OnPolicyRunner:
         }
         algorithm_classes = {
             "FPO": FPO,
+            "FSPPO": FSPPO,
             "IMFFPO": IMFFPO,
             "PMFFPO": PMFFPO,
         }
@@ -88,16 +89,20 @@ class OnPolicyRunner:
                 f"{train_cfg.algorithm.class_name!r}; expected one of "
                 f"{sorted(algorithm_classes)}"
             ) from exc
-        expected_algorithms = {
-            ActorCritic: FPO,
-            IMFActorCritic: IMFFPO,
-            PMFActorCritic: PMFFPO,
+        allowed_algorithms = {
+            ActorCritic: (FPO,),
+            IMFActorCritic: (IMFFPO,),
+            PMFActorCritic: (PMFFPO, FSPPO),
         }
-        if expected_algorithms[policy_class] is not algorithm_class:
+        if algorithm_class not in allowed_algorithms[policy_class]:
+            allowed_names = sorted(
+                algorithm.__name__ for algorithm in allowed_algorithms[policy_class]
+            )
             raise ValueError(
                 "Policy and algorithm variants must be selected together; got "
                 f"policy={train_cfg.policy.class_name!r}, "
-                f"algorithm={train_cfg.algorithm.class_name!r}"
+                f"algorithm={train_cfg.algorithm.class_name!r}; expected one of "
+                f"{allowed_names}"
             )
 
         policy: ActorCritic = policy_class(
@@ -494,9 +499,12 @@ class OnPolicyRunner:
             "train/entropy_loss": entropy_loss,
             "train/explained_variance": metrics.get("explained_variance", 0.0),
             "train/learning_rate": self.alg.learning_rate,
-            "train/loss": surrogate_loss
-            + self.alg.value_loss_coef * value_loss
-            + self.alg.knn_entropy_coef * entropy_loss,
+            "train/loss": locs["loss_dict"].get(
+                "total_loss",
+                surrogate_loss
+                + self.alg.value_loss_coef * value_loss
+                + self.alg.knn_entropy_coef * entropy_loss,
+            ),
             "train/pg_loss": surrogate_loss,
             "train/policy_gradient_loss": surrogate_loss,
             "train/std": metrics.get("action_std", 0.0),
@@ -927,7 +935,7 @@ class OnPolicyRunner:
             eval_results = self.evaluate_checkpoint(checkpoint_path, iteration)
 
             if eval_results is None:
-                print(f"  Skipped due to error")
+                print("  Skipped due to error")
                 continue
 
             # Store results

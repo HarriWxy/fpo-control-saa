@@ -5,6 +5,6 @@
 
 """Implementation of different RL agents."""
 
-from .fpo import FPO, IMFFPO, PMFFPO
+from .fpo import FPO, FSPPO, IMFFPO, PMFFPO
 
-__all__ = ["FPO", "IMFFPO", "PMFFPO"]
+__all__ = ["FPO", "FSPPO", "IMFFPO", "PMFFPO"]

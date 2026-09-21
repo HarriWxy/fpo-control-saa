@@ -18,10 +18,11 @@ def add_fpo_args(parser: argparse.ArgumentParser):
         "--algorithm",
         type=str,
         default=None,
-        choices=("fpo", "imf_fpo", "pmf_fpo"),
+        choices=("fpo", "imf_fpo", "pmf_fpo", "fsppo"),
         help=(
             "Policy variant. 'imf_fpo' selects Improved MeanFlow and "
-            "'pmf_fpo' selects Pixel MeanFlow; omitted keeps the task default."
+            "'pmf_fpo' selects Pixel MeanFlow; 'fsppo' adds a same-noise "
+            "transport-map trust region; omitted keeps the task default."
         ),
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
@@ -105,5 +106,15 @@ def update_fpo_cfg(agent_cfg: FpoRslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.algorithm.knn_entropy_coef = 0.0
         if args_cli.experiment_name is None:
             agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_pmf_fpo"
+    elif algorithm_variant == "fsppo":
+        agent_cfg.policy.class_name = "PMFActorCritic"
+        agent_cfg.algorithm.class_name = "FSPPO"
+        # The explicit F_theta(s, eps) penalty uses pMF's direct t=1 -> r=0
+        # transport map, so it must match the one-NFE rollout policy.
+        agent_cfg.policy.sampling_steps = 1
+        agent_cfg.algorithm.schedule = "fixed"
+        agent_cfg.algorithm.knn_entropy_coef = 0.0
+        if args_cli.experiment_name is None:
+            agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_fsppo"
 
     return agent_cfg
