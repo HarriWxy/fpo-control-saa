@@ -8,13 +8,14 @@ from __future__ import annotations
 import os
 import statistics
 import time
-import torch
 from collections import deque
-
+from math import isfinite
 from typing import TYPE_CHECKING
 
+import torch
+
 import isaaclab_fpo
-from isaaclab_fpo.algorithms import FPO, FSPPO, IMFFPO, PMFFPO
+from isaaclab_fpo.algorithms import FPO, FSPPO, IMFFPO, PMFFPO, FSPPOJoint
 
 if TYPE_CHECKING:
     from isaaclab_fpo.rl_cfg import FpoRslRlOnPolicyRunnerCfg
@@ -70,6 +71,7 @@ class OnPolicyRunner:
         algorithm_classes = {
             "FPO": FPO,
             "FSPPO": FSPPO,
+            "FSPPOJoint": FSPPOJoint,
             "IMFFPO": IMFFPO,
             "PMFFPO": PMFFPO,
         }
@@ -92,7 +94,7 @@ class OnPolicyRunner:
         allowed_algorithms = {
             ActorCritic: (FPO,),
             IMFActorCritic: (IMFFPO,),
-            PMFActorCritic: (PMFFPO, FSPPO),
+            PMFActorCritic: (PMFFPO, FSPPO, FSPPOJoint),
         }
         if algorithm_class not in allowed_algorithms[policy_class]:
             allowed_names = sorted(
@@ -354,7 +356,20 @@ class OnPolicyRunner:
 
             stop = time.perf_counter()
             learn_time = stop - start
-            self.current_learning_iteration = it
+            # Legacy runners store the zero-based loop index.  FSPPOJoint
+            # checkpoints instead store the number of completed updates so a
+            # resumed run starts at the *next* update rather than repeating
+            # the checkpointed one.  Keep the old convention untouched for
+            # every existing algorithm/checkpoint family.
+            self.current_learning_iteration = (
+                it + 1 if self._is_fsppo_joint() else it
+            )
+            if self._is_fsppo_joint() and self.log_dir is None:
+                # Legacy runner clocks advance inside log().  A joint learner
+                # also needs correct checkpoint counters in intentionally
+                # logless smoke/tests, where log() is never reached.
+                self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
+                self.tot_time += collection_time + learn_time
             # log info
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
@@ -362,7 +377,14 @@ class OnPolicyRunner:
 
                 # Save model
                 if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                    checkpoint_iteration = (
+                        self.current_learning_iteration
+                        if self._is_fsppo_joint()
+                        else it
+                    )
+                    self.save(
+                        os.path.join(self.log_dir, f"model_{checkpoint_iteration}.pt")
+                    )
 
             # Clear episode infos
             ep_infos.clear()
@@ -574,48 +596,95 @@ class OnPolicyRunner:
         )
         print(log_string)
 
-    def save(self, path: str, infos=None):
-        # -- Prepare model state dict (use EMA if available)
-        model_state_dict = self.alg.policy.state_dict()
-        if self.alg.ema is not None and self.alg.tot_timesteps > self.alg.ema_warmup_steps:
-            # Replace actor weights with EMA shadow params.
-            # EMA tracks policy.actor params (keys like "0.weight"), but
-            # policy.state_dict() prefixes them with "actor." ("actor.0.weight").
-            # Only do this after EMA warmup — before warmup, shadow params are
-            # copies of random init weights, not the current trained weights.
-            for name, ema_param in self.alg.ema.shadow_params.items():
-                full_name = f"actor.{name}"
-                if full_name in model_state_dict:
-                    model_state_dict[full_name] = ema_param.clone()
+    def _is_fsppo_joint(self) -> bool:
+        """Whether this runner has the checkpoint contract of FSPPOJoint."""
+        return isinstance(self.alg, FSPPOJoint)
 
-        # -- Save model
-        saved_dict = {
-            "model_state_dict": model_state_dict,
-            "optimizer_state_dict": self.alg.optimizer.state_dict(),
-            "iter": self.current_learning_iteration,
-            "infos": infos,
-            "policy_class_name": self.cfg.policy.class_name,
-            "algorithm_class_name": self.cfg.algorithm.class_name,
+    @staticmethod
+    def _clone_state_dict(state_dict: dict) -> dict:
+        """Clone tensors before producing a distinct training/evaluation snapshot."""
+        return {
+            name: value.detach().clone() if isinstance(value, torch.Tensor) else value
+            for name, value in state_dict.items()
         }
-        # -- Save EMA state if used
-        if self.alg.ema is not None:
-            saved_dict["ema_state_dict"] = self.alg.ema.state_dict()
-        # -- Save observation normalizer if used
-        if self.empirical_normalization:
-            saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
-            saved_dict["privileged_obs_norm_state_dict"] = (
-                self.privileged_obs_normalizer.state_dict()
+
+    def _fsppo_joint_runner_state_dict(self) -> dict:
+        """Return runner counters whose units differ from FSPPOJoint's counters.
+
+        ``FSPPOJoint.tot_timesteps`` counts rollout updates.  The runner's
+        ``tot_timesteps`` counts individual environment transitions, while
+        ``completed_env_steps`` is the per-environment simulation clock used
+        by Isaac Lab's ``common_step_counter``.
+        """
+        completed_env_steps = self.current_learning_iteration * self.num_steps_per_env
+        # ``log()`` owns the legacy runner counter and is skipped when the
+        # runner has no log directory.  In that case derive the exact global
+        # transition count for this single-learner algorithm instead of
+        # serializing a misleading zero.
+        total_transitions = self.tot_timesteps
+        if total_transitions == 0 and completed_env_steps:
+            total_transitions = completed_env_steps * self.env.num_envs
+        return {
+            "version": 1,
+            "tot_timesteps": total_transitions,
+            "tot_time": self.tot_time,
+            "completed_env_steps": completed_env_steps,
+        }
+
+    @staticmethod
+    def _validate_fsppo_joint_runner_state(state: object) -> None:
+        """Validate the optional runner-state extension before it is restored."""
+        if not isinstance(state, dict):
+            raise TypeError("FSPPOJoint checkpoint runner state must be a dict")
+        if state.get("version") != 1:
+            raise ValueError("Unsupported FSPPOJoint checkpoint runner-state version")
+        for name in ("tot_timesteps", "completed_env_steps"):
+            value = state.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Invalid FSPPOJoint checkpoint runner {name}")
+        elapsed = state.get("tot_time")
+        if (
+            isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or not isfinite(elapsed)
+            or elapsed < 0
+        ):
+            raise ValueError("Invalid FSPPOJoint checkpoint runner tot_time")
+
+    def _restore_fsppo_joint_runner_state(self, loaded_dict: dict) -> None:
+        """Restore transition and per-environment counters for a joint resume."""
+        state = loaded_dict.get("fsppo_joint_runner_state_dict")
+        if state is None:
+            # Version-1 joint checkpoints made before this runner extension
+            # still have a completed-update count.  Derive the two distinct
+            # clocks without repeating the legacy ``* num_envs`` bug for the
+            # environment's per-env counter.
+            completed_env_steps = (
+                self.current_learning_iteration * self.num_steps_per_env
+            )
+            self.tot_timesteps = completed_env_steps * self.env.num_envs
+        else:
+            self._validate_fsppo_joint_runner_state(state)
+            self.tot_timesteps = state["tot_timesteps"]
+            self.tot_time = float(state["tot_time"])
+            completed_env_steps = state["completed_env_steps"]
+        if hasattr(self.env.unwrapped, "common_step_counter"):
+            self.env.unwrapped.common_step_counter = completed_env_steps
+            print(
+                "[INFO] Restored FSPPOJoint common_step_counter to "
+                f"{completed_env_steps}"
             )
 
-        # save model
-        torch.save(saved_dict, path)
+    def _validate_checkpoint_compatibility(
+        self, loaded_dict: dict, *, require_online_state: bool = False
+    ) -> None:
+        """Reject a checkpoint whose policy or joint-sampling contract differs.
 
-        # upload model to external logging service
-        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
-            self.writer.save_model(path, self.current_learning_iteration)
-
-    def load(self, path: str, load_optimizer: bool = True):
-        loaded_dict = torch.load(path, weights_only=False)
+        FSPPOJoint's probability ratio is defined for a particular conditional
+        Gaussian sampler.  Unlike the legacy FPO variants, it cannot safely
+        treat an unlabelled or merely shape-compatible checkpoint as an
+        interchangeable policy.
+        """
         saved_policy_class = loaded_dict.get("policy_class_name")
         saved_algorithm_class = loaded_dict.get("algorithm_class_name")
         if (
@@ -638,10 +707,117 @@ class OnPolicyRunner:
                 f"{self.cfg.algorithm.class_name!r}. Select the matching "
                 "--algorithm variant before loading."
             )
-        # -- Load model
-        resumed_training = self.alg.policy.load_state_dict(
-            loaded_dict["model_state_dict"]
+
+        if not self._is_fsppo_joint():
+            return
+
+        if saved_policy_class != self.cfg.policy.class_name:
+            raise ValueError(
+                "FSPPOJoint checkpoint is missing its exact policy-class marker"
+            )
+        if saved_algorithm_class != self.cfg.algorithm.class_name:
+            raise ValueError(
+                "FSPPOJoint checkpoint is missing its exact algorithm-class marker"
+            )
+        if loaded_dict.get("fsppo_joint_checkpoint_version") != 1:
+            raise ValueError(
+                "FSPPOJoint checkpoint marker is missing or has an unsupported version"
+            )
+        algorithm_state = loaded_dict.get("algorithm_state_dict")
+        if algorithm_state is None:
+            raise ValueError("FSPPOJoint checkpoint is missing algorithm_state_dict")
+        if not isinstance(algorithm_state, dict):
+            raise TypeError("FSPPOJoint checkpoint algorithm_state_dict must be a dict")
+        current_state = self.alg.state_dict()
+        if (
+            algorithm_state.get("version") != current_state.get("version")
+            or algorithm_state.get("sampler") != current_state.get("sampler")
+        ):
+            raise ValueError("FSPPOJoint checkpoint sampling contract mismatch")
+        if "model_state_dict" not in loaded_dict:
+            raise ValueError("FSPPOJoint checkpoint is missing model_state_dict")
+        if require_online_state and "online_model_state_dict" not in loaded_dict:
+            raise ValueError(
+                "FSPPOJoint checkpoint is missing online_model_state_dict for resume"
+            )
+        runner_state = loaded_dict.get("fsppo_joint_runner_state_dict")
+        if runner_state is not None:
+            self._validate_fsppo_joint_runner_state(runner_state)
+
+    def save(self, path: str, infos=None):
+        # Keep a distinct online snapshot for FSPPOJoint resumption.  The
+        # ordinary model_state_dict remains the evaluation artifact and may
+        # have its actor replaced by EMA below.
+        is_fsppo_joint = self._is_fsppo_joint()
+        if is_fsppo_joint:
+            online_model_state_dict = self._clone_state_dict(
+                self.alg.policy.state_dict()
+            )
+            # EMA replaces mapping entries, so a shallow mapping copy keeps
+            # this evaluation artifact separate from the online snapshot.
+            model_state_dict = dict(online_model_state_dict)
+        else:
+            # Preserve legacy checkpoint cost and tensor-reference behavior.
+            online_model_state_dict = None
+            model_state_dict = self.alg.policy.state_dict()
+        if self.alg.ema is not None and self.alg.tot_timesteps > self.alg.ema_warmup_steps:
+            # Replace actor weights with EMA shadow params.
+            # EMA tracks policy.actor params (keys like "0.weight"), but
+            # policy.state_dict() prefixes them with "actor." ("actor.0.weight").
+            # Only do this after EMA warmup — before warmup, shadow params are
+            # copies of random init weights, not the current trained weights.
+            for name, ema_param in self.alg.ema.shadow_params.items():
+                full_name = f"actor.{name}"
+                if full_name in model_state_dict:
+                    model_state_dict[full_name] = ema_param.clone()
+
+        # -- Save model
+        saved_dict = {
+            "model_state_dict": model_state_dict,
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+            "policy_class_name": self.cfg.policy.class_name,
+            "algorithm_class_name": self.cfg.algorithm.class_name,
+        }
+        algorithm_state_dict = getattr(self.alg, "state_dict", None)
+        if callable(algorithm_state_dict):
+            saved_dict["algorithm_state_dict"] = algorithm_state_dict()
+        if is_fsppo_joint:
+            saved_dict["fsppo_joint_checkpoint_version"] = 1
+            saved_dict["online_model_state_dict"] = online_model_state_dict
+            saved_dict["fsppo_joint_runner_state_dict"] = (
+                self._fsppo_joint_runner_state_dict()
+            )
+        # -- Save EMA state if used
+        if self.alg.ema is not None:
+            saved_dict["ema_state_dict"] = self.alg.ema.state_dict()
+        # -- Save observation normalizer if used
+        if self.empirical_normalization:
+            saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
+            saved_dict["privileged_obs_norm_state_dict"] = (
+                self.privileged_obs_normalizer.state_dict()
+            )
+
+        # save model
+        torch.save(saved_dict, path)
+
+        # upload model to external logging service
+        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
+            self.writer.save_model(path, self.current_learning_iteration)
+
+    def load(self, path: str, load_optimizer: bool = True):
+        loaded_dict = torch.load(path, weights_only=False)
+        self._validate_checkpoint_compatibility(
+            loaded_dict, require_online_state=load_optimizer
         )
+        # -- Load model
+        model_state_key = (
+            "online_model_state_dict"
+            if self._is_fsppo_joint() and load_optimizer
+            else "model_state_dict"
+        )
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict[model_state_key])
         # -- Load observation normalizer if used
         if self.empirical_normalization:
             if resumed_training:
@@ -661,6 +837,9 @@ class OnPolicyRunner:
         if load_optimizer and resumed_training:
             # -- algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            algorithm_loader = getattr(self.alg, "load_state_dict", None)
+            if callable(algorithm_loader) and "algorithm_state_dict" in loaded_dict:
+                algorithm_loader(loaded_dict["algorithm_state_dict"])
         # -- Load EMA state if used
         if self.alg.ema is not None:
             if "ema_state_dict" in loaded_dict:
@@ -670,15 +849,23 @@ class OnPolicyRunner:
                 print("[WARNING] EMA is enabled but no EMA state found in checkpoint")
         # -- load current learning iteration
         if resumed_training:
-            self.current_learning_iteration = loaded_dict["iter"]
-            # -- restore common_step_counter to avoid restarting episode length warmup
-            # Calculate total steps from iteration count
-            steps_per_iteration = self.num_steps_per_env * self.env.num_envs
-            total_steps = self.current_learning_iteration * steps_per_iteration
-            # Set the environment's common_step_counter
-            if hasattr(self.env.unwrapped, 'common_step_counter'):
-                self.env.unwrapped.common_step_counter = total_steps
-                print(f"[INFO] Restored common_step_counter to {total_steps} based on iteration {self.current_learning_iteration}")
+            if self._is_fsppo_joint():
+                # A model-only load is inference/evaluation, not a resume: it
+                # must not alter the live runner clocks.  FSPPOJoint's own
+                # algorithm state is likewise restored only with its optimizer.
+                if load_optimizer:
+                    self.current_learning_iteration = loaded_dict["iter"]
+                    self._restore_fsppo_joint_runner_state(loaded_dict)
+            else:
+                self.current_learning_iteration = loaded_dict["iter"]
+                # -- restore common_step_counter to avoid restarting episode length warmup
+                # Calculate total steps from iteration count
+                steps_per_iteration = self.num_steps_per_env * self.env.num_envs
+                total_steps = self.current_learning_iteration * steps_per_iteration
+                # Set the environment's common_step_counter
+                if hasattr(self.env.unwrapped, 'common_step_counter'):
+                    self.env.unwrapped.common_step_counter = total_steps
+                    print(f"[INFO] Restored common_step_counter to {total_steps} based on iteration {self.current_learning_iteration}")
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
@@ -770,6 +957,11 @@ class OnPolicyRunner:
 
             # Load checkpoint (this loads both model and normalizer)
             loaded_dict = torch.load(checkpoint_path, weights_only=False)
+            if (
+                self._is_fsppo_joint()
+                or loaded_dict.get("algorithm_class_name") == "FSPPOJoint"
+            ):
+                self._validate_checkpoint_compatibility(loaded_dict)
             self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
 
             # Load normalizer state from checkpoint if available

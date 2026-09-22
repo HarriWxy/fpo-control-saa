@@ -182,7 +182,7 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     """Configuration for the FPO (Flow Policy Optimization) algorithm."""
 
     class_name: str = "FPO"
-    """Algorithm class name (``FPO``, ``IMFFPO``, ``PMFFPO`` or ``FSPPO``)."""
+    """Algorithm class name (``FPO``, ``IMFFPO``, ``PMFFPO``, ``FSPPO`` or ``FSPPOJoint``)."""
 
     num_learning_epochs: int = 16
     """The number of learning epochs per update. Default is 16.
@@ -363,6 +363,44 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     ``None`` reuses all ``n_samples_per_action`` samples.  A smaller positive
     value reduces the two extra actor forwards per minibatch without changing
     the pMF score-ratio samples used by the policy surrogate.
+    """
+
+    # Joint-latent FSPPO parameters.  ``FSPPOJoint`` treats the one-NFE pMF
+    # map plus ``action_perturb_std`` as a conditional Gaussian policy, rather
+    # than exponentiating the pMF regression residual as an importance ratio.
+    fsppo_joint_kl_target: float = 0.01
+    """Target upper bound for FSPPOJoint's mean joint conditional-Gaussian KL.
+
+    With a fixed action perturbation standard deviation ``sigma``, the
+    same-noise map estimate obeys ``joint_kl = D_map / (2 * sigma**2)``.
+    FSPPOJoint uses this target for candidate acceptance and its dual update.
+    """
+
+    fsppo_joint_kl_coef: float = 1.0
+    """Initial non-negative coefficient of FSPPOJoint's map-KL penalty."""
+
+    fsppo_joint_dual_lr: float = 0.1
+    """Dual-ascent step size for adapting FSPPOJoint's KL coefficient."""
+
+    fsppo_joint_kl_coef_max: float = 1000.0
+    """Upper bound for FSPPOJoint's adaptive KL penalty coefficient."""
+
+    fsppo_joint_map_samples: int = 2
+    """Number of same-noise pMF map samples per state for FSPPOJoint losses."""
+
+    fsppo_joint_probe_size: int = 1024
+    """Fixed-probe sample count used to accept or reject FSPPOJoint candidates."""
+
+    fsppo_joint_max_backtracks: int = 5
+    """Maximum learning-rate backtracks allowed for one FSPPOJoint candidate."""
+
+    fsppo_joint_backtrack_factor: float = 0.5
+    """Multiplicative learning-rate reduction used by FSPPOJoint backtracking."""
+
+    fsppo_joint_aux_loss_coef: float = 0.0
+    """Optional pMF regression auxiliary-loss coefficient for FSPPOJoint.
+
+    The default leaves the exact joint-Gaussian PPO objective unmodified.
     """
 
     ema_decay: float = 0.95

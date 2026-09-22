@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
-
+import math
 from typing import TYPE_CHECKING
+
+import torch
+from torch import nn
 
 from isaaclab_fpo.utils import resolve_nn_activation
 
@@ -765,6 +766,90 @@ class PMFActorCritic(ActorCritic):
         )
         transported = self.actor_scale * transported
         return transported.reshape(*noise.shape[:-1], self.num_actions)
+
+    def sample_transport(
+        self, observations: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample an action from the explicit pMF transport distribution.
+
+        This interface represents the rollout distribution as a joint sample
+        of a standard-normal transport latent and a fixed-variance conditional
+        Gaussian action.  The latent prior is intentionally not part of the
+        returned log-probability: it cancels when an old and a new policy are
+        evaluated at the stored latent.
+
+        Args:
+            observations: Policy observations with shape ``[batch, obs_dim]``.
+
+        Returns:
+            A tuple containing the sampled actions ``[batch, action_dim]``,
+            transport latents ``[batch, action_dim]``, conditional means
+            ``[batch, action_dim]``, and conditional action log-probabilities
+            ``[batch, 1]``. 这是干啥用的？
+        """
+        if observations.ndim != 2 or observations.shape[1] != self.num_actor_obs:
+            raise ValueError(
+                "observations must have shape [batch, "
+                f"{self.num_actor_obs}], got {tuple(observations.shape)}"
+            )
+
+        batch_size = observations.shape[0]
+        latent = torch.randn(
+            (batch_size, self.num_actions),
+            device=observations.device,
+            dtype=observations.dtype,
+        )
+        mean = self.transport_actions(observations, latent)
+        action_std = self._conditional_action_std()
+        actions = mean + action_std * torch.randn_like(mean)
+        log_prob = self.conditional_action_log_prob(actions, mean)
+        return actions, latent, mean, log_prob
+
+    def conditional_action_log_prob(
+        self, actions: torch.Tensor, means: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute the fixed-variance Gaussian conditional action density.
+
+        The returned density is ``log p(actions | means)`` only.  It does not
+        include the standard-normal transport-latent prior, allowing callers
+        to form an old/new joint ratio with the same stored latent.
+
+        Args:
+            actions: Actions with shape ``[..., action_dim]``.
+            means: Conditional transport means with shape
+                ``[..., action_dim]``.
+
+        Returns:
+            Conditional log-probabilities summed over action dimensions with
+            shape ``[..., 1]``.
+        """
+        if actions.shape != means.shape:
+            raise ValueError(
+                "actions and means must have identical shapes; got "
+                f"{tuple(actions.shape)} and {tuple(means.shape)}"
+            )
+        if actions.ndim < 1 or actions.shape[-1] != self.num_actions:
+            raise ValueError(
+                "actions and means must end with action_dim="
+                f"{self.num_actions}; got {tuple(actions.shape)}"
+            )
+
+        action_std = self._conditional_action_std()
+        standardized_residual = (actions - means) / action_std
+        log_normalizer = math.log(2.0 * math.pi * action_std**2)
+        return -0.5 * (
+            standardized_residual.square() + log_normalizer
+        ).sum(dim=-1, keepdim=True)
+
+    def _conditional_action_std(self) -> float:
+        """Return the finite, positive fixed action-noise standard deviation."""
+        action_std = float(self.action_perturb_std)
+        if not math.isfinite(action_std) or action_std <= 0.0:
+            raise ValueError(
+                "The joint transport interface requires a finite, positive "
+                "action_perturb_std."
+            )
+        return action_std
 
     def _predict_u_and_v(
         self,

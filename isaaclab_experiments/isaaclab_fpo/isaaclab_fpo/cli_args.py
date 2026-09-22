@@ -18,11 +18,12 @@ def add_fpo_args(parser: argparse.ArgumentParser):
         "--algorithm",
         type=str,
         default=None,
-        choices=("fpo", "imf_fpo", "pmf_fpo", "fsppo"),
+        choices=("fpo", "imf_fpo", "pmf_fpo", "fsppo", "fsppo_joint"),
         help=(
             "Policy variant. 'imf_fpo' selects Improved MeanFlow and "
             "'pmf_fpo' selects Pixel MeanFlow; 'fsppo' adds a same-noise "
-            "transport-map trust region; omitted keeps the task default."
+            "transport-map trust region; 'fsppo_joint' selects the exact "
+            "joint-latent Gaussian PPO variant; omitted keeps the task default."
         ),
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
@@ -116,5 +117,17 @@ def update_fpo_cfg(agent_cfg: FpoRslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.algorithm.knn_entropy_coef = 0.0
         if args_cli.experiment_name is None:
             agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_fsppo"
+    elif algorithm_variant == "fsppo_joint":
+        agent_cfg.policy.class_name = "PMFActorCritic"
+        agent_cfg.algorithm.class_name = "FSPPOJoint"
+        # The conditional Gaussian likelihood is defined around pMF's direct
+        # one-NFE public-action transport map.  Its constructor validates the
+        # fixed positive action perturbation and other sampler invariants.
+        agent_cfg.policy.sampling_steps = 1
+        agent_cfg.algorithm.schedule = "fixed"
+        agent_cfg.algorithm.knn_entropy_coef = 0.0
+        agent_cfg.algorithm.trust_region_mode = "ppo"
+        if args_cli.experiment_name is None:
+            agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_fsppo_joint"
 
     return agent_cfg
