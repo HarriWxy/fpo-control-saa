@@ -200,7 +200,7 @@ class FSPPOJoint(FPO):
         # Prove that replay still refers to the behavior actor, not an EMA or
         # a policy changed between collection and update.
         self._validate_replay()
-        totals: dict[str, float] = {}
+        totals: dict[str, torch.Tensor] = {}
         accepted = rejected = attempted = 0
         last_step_lr = 0.0
         coefficient_used = self.kl_coefficient
@@ -229,11 +229,11 @@ class FSPPOJoint(FPO):
             accepted += 1
             last_step_lr = candidate_lr
             statistics["mean_grad_norm_before_clip"] = norm.detach()
-            statistics["mean_grad_norm_after_clip"] = norm.detach().clamp(
-                max=self.max_grad_norm
-            )
+            statistics["mean_grad_norm_after_clip"] = norm.detach() * (
+                self.max_grad_norm / (norm.detach() + 1e-6)
+            ).clamp(max=1.0)
             for name, value in statistics.items():
-                totals[name] = totals.get(name, 0.0) + float(value.detach())
+                totals[name] = totals.get(name, 0.0) + value.detach()
 
         with torch.no_grad():
             probe_kl = self._probe_kl(probe)
@@ -254,12 +254,12 @@ class FSPPOJoint(FPO):
                 ),
             )
             variance = self.storage.returns.var(unbiased=False)
-            explained = (
+            explained = torch.where(
+                variance > 1e-8,
                 1
                 - (self.storage.returns - self.storage.values).var(unbiased=False)
-                / variance
-                if variance > 1e-8
-                else variance.new_zeros(())
+                / variance,
+                variance.new_zeros(()),
             )
             action_std = self.storage.actions.std(dim=(0, 1), unbiased=False).mean()
         means = {key: value / max(accepted, 1) for key, value in totals.items()}
@@ -269,8 +269,8 @@ class FSPPOJoint(FPO):
             # separate from the analytically integrated map KL below.
             "approx_kl": means.get("sample_joint_kl", 0.0),
             "clip_fraction": means.get("clip_fraction", 0.0),
-            "explained_variance": float(explained),
-            "action_std": float(action_std),
+            "explained_variance": explained,
+            "action_std": action_std,
             "joint/action_noise_std": self.sigma,
             "joint/kl_coefficient_used": coefficient_used,
             "joint/kl_coefficient_next": self.kl_coefficient,
@@ -288,13 +288,12 @@ class FSPPOJoint(FPO):
             "mean_grad_norm_after_clip": means.get("mean_grad_norm_after_clip", 0.0),
         }
         for name, samples in (("probe", probe_kl), ("audit", audit_kl)):
-            metrics[f"joint/{name}_kl_mean"] = float(samples.mean())
-            metrics[f"joint/{name}_kl_p95"] = float(
-                torch.quantile(samples.flatten(), 0.95)
-            )
-            metrics[f"joint/{name}_kl_max"] = float(samples.max())
+            mean = samples.mean()
+            metrics[f"joint/{name}_kl_mean"] = mean
+            metrics[f"joint/{name}_kl_p95"] = torch.quantile(samples.flatten(), 0.95)
+            metrics[f"joint/{name}_kl_max"] = samples.max()
             metrics[f"joint/{name}_map_distance"] = (
-                float(samples.mean()) * 2 * self.sigma**2
+                mean * 2 * self.sigma**2
             )
         for name in ("aux_u_loss", "aux_v_loss", "aux_jvp_norm"):
             if name in means:
@@ -302,14 +301,16 @@ class FSPPOJoint(FPO):
         self.storage.clear()
         self.update_counter += 1
         self.tot_timesteps += 1
-        return {
+        loss_dict = {
             "surrogate_loss": means.get("surrogate_loss", 0.0),
             "value_loss": means.get("value_loss", 0.0),
             "map_kl_loss": means.get("map_kl_loss", 0.0),
             "pmf_aux_loss": means.get("pmf_aux_loss", 0.0),
             "total_loss": means.get("total_loss", 0.0),
-            "metrics": metrics,
         }
+        self._metrics_to_cpu(loss_dict, metrics)
+        loss_dict["metrics"] = metrics
+        return loss_dict
 
     def _current_sampler_contract(self) -> dict:
         return {
@@ -366,10 +367,9 @@ class FSPPOJoint(FPO):
 
     @torch.no_grad()
     def _probe_kl(self, probe: dict[str, torch.Tensor]) -> torch.Tensor:
-        actions = self.policy.transport_actions(probe["obs"], probe["noise"])
-        return ((actions - probe["old_actions"]) / self.sigma).square().sum(
-            dim=-1
-        ) * 0.5
+        """Wasserstein distance between current and old transport actions."""
+        actions: torch.Tensor = self.policy.transport_actions(probe["obs"], probe["noise"])
+        return ((actions - probe["old_actions"])).absolute().sum(dim=-1)
 
     def _batch_loss(
         self, batch: dict[str, torch.Tensor]
@@ -408,9 +408,7 @@ class FSPPOJoint(FPO):
         current_map = self.policy.transport_actions(obs, noise)
         with torch.no_grad():
             old_map = self.policy.transport_actions(obs, noise, actor=self._old_actor)
-        map_kl = ((current_map - old_map) / self.sigma).square().sum(
-            dim=-1
-        ).mean() * 0.5
+        map_kl = (current_map - old_map).absolute().sum(dim=-1).mean()
         aux_loss, aux_metrics = self._auxiliary_loss(obs, actions)
         penalty = self.kl_coefficient * map_kl
         weighted_aux = self.aux_loss_coef * aux_loss

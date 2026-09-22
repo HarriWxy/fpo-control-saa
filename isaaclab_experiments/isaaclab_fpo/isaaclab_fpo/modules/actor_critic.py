@@ -43,6 +43,23 @@ class ActorCritic(nn.Module):
         self.sampling_steps = cfg.sampling_steps
         self.cfm_loss_reduction = cfg.cfm_loss_reduction
 
+        # Deterministic sampling data is runtime-only, preserving old checkpoint
+        # keys. Integer frequencies also survive module dtype conversions exactly.
+        self.register_buffer(
+            "_timestep_freqs",
+            2 ** torch.arange(self.timestep_embed_dim // 2),
+            persistent=False,
+        )
+        for name in (
+            "_flow_t_current",
+            "_flow_dt",
+            "_flow_embeddings",
+            "_unit_time_embedding",
+        ):
+            self.register_buffer(name, torch.empty(0), persistent=False)
+        self._flow_cache_key = None
+        self._unit_time_cache_key = None
+
         # Inference parameters
         self.actor_scale = cfg.actor_scale
 
@@ -120,11 +137,19 @@ class ActorCritic(nn.Module):
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
 
-        # Compile the inner flow integration loop for CUDA graph replay.
-        # Cached CUDA graph can lead to a 3~9x speedup.
+        # Keep parameters on the original modules so compilation does not alter
+        # checkpoint keys. CPU callers use the eager path without compilation.
         self._compiled_integrate_flow = torch.compile(
             self._integrate_flow, mode="reduce-overhead"
         )
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        # Recompute constants rather than reusing values rounded by, for example,
+        # a float32 -> float16 -> float32 module conversion.
+        self._flow_cache_key = None
+        self._unit_time_cache_key = None
+        return result
 
     def reset(self, dones=None):
         pass
@@ -141,23 +166,19 @@ class ActorCritic(nn.Module):
         batch_size = observations.shape[0]
 
         if not self.training:
-            x_t = torch.zeros(size=(batch_size, self.num_actions), device=device)
+            x_t = torch.zeros(
+                size=(batch_size, self.num_actions),
+                device=device,
+                dtype=observations.dtype,
+            )
         else:
-            x_t = torch.randn(size=(batch_size, self.num_actions), device=device)
+            x_t = torch.randn(
+                size=(batch_size, self.num_actions),
+                device=device,
+                dtype=observations.dtype,
+            )
 
-        flow_steps = self.sampling_steps
-        full_t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=device)
-        t_current = full_t_path[:-1]
-        t_next = full_t_path[1:]
-        dt = t_next - t_current
-
-        # Use compiled integration loop for CUDA graph replay speedup
-        x_t = self._compiled_integrate_flow(
-            observations, x_t, t_current, dt, flow_steps
-        )
-
-        # Scale actions
-        actions = self.actor_scale * x_t
+        actions = self._sample_flow(observations, x_t)
 
         # Perturb action with random noise, this can be interpreted as an entropy regularizer
         if self.training and self.action_perturb_std > 0:
@@ -227,11 +248,68 @@ class ActorCritic(nn.Module):
     def _embed_timestep(self, t: torch.Tensor) -> torch.Tensor:
         """Embed (*, 1) timestep into (*, timestep_embed_dim)."""
         assert t.shape[-1] == 1
-        freqs = 2 ** torch.arange(self.timestep_embed_dim // 2, device=t.device)
+        freqs = self._timestep_freqs.to(device=t.device)
         scaled_t = t * freqs
         out = torch.cat([torch.cos(scaled_t), torch.sin(scaled_t)], dim=-1)
         assert out.shape == (*t.shape[:-1], self.timestep_embed_dim)
         return out
+
+    def _embed_flow_schedule(
+        self, t_current: torch.Tensor, dt: torch.Tensor
+    ) -> torch.Tensor:
+        """Embed all fixed inference nodes once, before entering the flow loop."""
+        return self._embed_timestep(t_current[:, None])
+
+    def _get_flow_schedule(
+        self, observations: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cache the sampling grid and embeddings for this step count/device/dtype."""
+        key = (self.sampling_steps, observations.device, observations.dtype)
+        if self._flow_cache_key != key:
+            # A cache first warmed during inference must remain usable by later
+            # autograd calls, which cannot save inference tensors for backward.
+            with torch.inference_mode(False), torch.no_grad():
+                path = torch.linspace(
+                    1.0,
+                    0.0,
+                    self.sampling_steps + 1,
+                    device=observations.device,
+                    dtype=observations.dtype,
+                )
+                self._flow_t_current = path[:-1]
+                self._flow_dt = path[1:] - path[:-1]
+                self._flow_embeddings = self._embed_flow_schedule(
+                    self._flow_t_current, self._flow_dt
+                )
+            self._flow_cache_key = key
+        return self._flow_t_current, self._flow_dt, self._flow_embeddings
+
+    def _get_unit_time_embedding(self, reference: torch.Tensor) -> torch.Tensor:
+        """Return the single h=1 embedding shared by every transport sample."""
+        key = (reference.device, reference.dtype)
+        if self._unit_time_cache_key != key:
+            with torch.inference_mode(False), torch.no_grad():
+                interval = torch.ones(
+                    (1, 1), device=reference.device, dtype=reference.dtype
+                )
+                self._unit_time_embedding = self._embed_timestep(interval)
+            self._unit_time_cache_key = key
+        return self._unit_time_embedding
+
+    def _sample_flow(
+        self, observations: torch.Tensor, noise: torch.Tensor
+    ) -> torch.Tensor:
+        """Generate public actions from prescribed noise and cached flow nodes."""
+        t_current, dt, embedded_steps = self._get_flow_schedule(observations)
+        integrate = (
+            self._compiled_integrate_flow
+            if observations.is_cuda
+            else self._integrate_flow
+        )
+        result = integrate(
+            observations, noise, t_current, dt, self.sampling_steps, embedded_steps
+        )
+        return self.actor_scale * result
 
     def flow_step(
         self,
@@ -263,6 +341,7 @@ class ActorCritic(nn.Module):
         t_current: torch.Tensor,
         dt: torch.Tensor,
         flow_steps: int,
+        embedded_steps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Inner flow integration loop extracted for torch.compile.
 
@@ -276,22 +355,17 @@ class ActorCritic(nn.Module):
             t_current: (flow_steps,) current timestep values.
             dt: (flow_steps,) timestep deltas.
             flow_steps: Number of integration steps (must be constant across calls).
+            embedded_steps: Optional cached embeddings at the sampling nodes.
 
         Returns:
             x_t: (batch_size, num_actions) integrated sample (denoised actions).
         """
         batch_size = observations.shape[0]
-        half_dim = self.timestep_embed_dim // 2
-        freqs = 2 ** torch.arange(
-            half_dim, device=observations.device, dtype=observations.dtype
-        )
+        if embedded_steps is None:
+            embedded_steps = self._embed_flow_schedule(t_current, dt)
 
         for i in range(flow_steps):
-            # Inline timestep embedding (avoids assert overhead in compiled path)
-            t_val = t_current[i].reshape(1, 1)
-            scaled_t = t_val * freqs  # (1, half_dim)
-            embedded_t = torch.cat([torch.cos(scaled_t), torch.sin(scaled_t)], dim=-1)
-            embedded_t = embedded_t.expand(batch_size, -1)
+            embedded_t = embedded_steps[i].expand(batch_size, -1)
 
             # Forward through actor network
             mlp_output = self.actor(torch.cat([observations, embedded_t, x_t], dim=-1))
@@ -339,31 +413,30 @@ class ActorCritic(nn.Module):
 
         # Initialize x_t based on eval_mode
         if eval_mode == "zero":
-            x_t = torch.zeros(size=(batch_size, self.num_actions), device=device)
+            x_t = torch.zeros(
+                size=(batch_size, self.num_actions),
+                device=device,
+                dtype=observations.dtype,
+            )
         elif eval_mode == "fixed_seed":
             generator = torch.Generator(device=device)
             generator.manual_seed(eval_fixed_seed)
             x_t = torch.randn(
-                size=(batch_size, self.num_actions), device=device, generator=generator
+                size=(batch_size, self.num_actions),
+                device=device,
+                dtype=observations.dtype,
+                generator=generator,
             )
         elif eval_mode == "random":
-            x_t = torch.randn(size=(batch_size, self.num_actions), device=device)
+            x_t = torch.randn(
+                size=(batch_size, self.num_actions),
+                device=device,
+                dtype=observations.dtype,
+            )
         else:
             raise ValueError(f"Unknown eval_mode: {eval_mode}")
 
-        flow_steps = self.sampling_steps
-        full_t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=device)
-        t_current = full_t_path[:-1]
-        t_next = full_t_path[1:]
-        dt = t_next - t_current
-
-        # Use compiled integration loop for CUDA graph replay speedup
-        x_t = self._compiled_integrate_flow(
-            observations, x_t, t_current, dt, flow_steps
-        )
-
-        actions = self.actor_scale * x_t
-        return actions
+        return self._sample_flow(observations, x_t)
 
     def evaluate(self, critic_observations, **kwargs):
         value = self.critic(critic_observations)
@@ -602,6 +675,18 @@ class IMFActorCritic(ActorCritic):
         mean_velocity, _ = self._predict_u_and_v(observations, x_t, r, t)
         return x_t - (t - r) * mean_velocity
 
+    def _embed_flow_schedule(
+        self, t_current: torch.Tensor, dt: torch.Tensor
+    ) -> torch.Tensor:
+        """Cache iMF's ordered pair of endpoint embeddings."""
+        return torch.cat(
+            [
+                self._embed_timestep((t_current + dt)[:, None]),
+                self._embed_timestep(t_current[:, None]),
+            ],
+            dim=-1,
+        )
+
     def _integrate_flow(
         self,
         observations: torch.Tensor,
@@ -609,26 +694,16 @@ class IMFActorCritic(ActorCritic):
         t_current: torch.Tensor,
         dt: torch.Tensor,
         flow_steps: int,
+        embedded_steps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Integrate mean-flow jumps from noise time one to action time zero."""
         batch_size = observations.shape[0]
-        half_dim = self.timestep_embed_dim // 2
-        freqs = 2 ** torch.arange(
-            half_dim, device=observations.device, dtype=observations.dtype
-        )
+        if embedded_steps is None:
+            embedded_steps = self._embed_flow_schedule(t_current, dt)
 
         for i in range(flow_steps):
-            t_value = t_current[i].reshape(1, 1)
-            r_value = (t_current[i] + dt[i]).reshape(1, 1)
-            embedded_r = torch.cat(
-                [torch.cos(r_value * freqs), torch.sin(r_value * freqs)], dim=-1
-            ).expand(batch_size, -1)
-            embedded_t = torch.cat(
-                [torch.cos(t_value * freqs), torch.sin(t_value * freqs)], dim=-1
-            ).expand(batch_size, -1)
-            output = self.actor(
-                torch.cat([observations, embedded_r, embedded_t, x_t], dim=-1)
-            )
+            embedded_rt = embedded_steps[i].expand(batch_size, -1)
+            output = self.actor(torch.cat([observations, embedded_rt, x_t], dim=-1))
             mean_velocity = self.mlp_output_scale * output[:, : self.num_actions]
 
             # dt = r - t is negative during reverse generation, hence this is
@@ -683,6 +758,15 @@ class PMFActorCritic(ActorCritic):
             raise ValueError("pmf_adaptive_gradient_norm_p must be non-negative")
         if self.pmf_adaptive_gradient_norm_eps <= 0:
             raise ValueError("pmf_adaptive_gradient_norm_eps must be positive")
+
+        # Joint training retains several map outputs until a shared backward,
+        # and rollout retains means for replay. Disable CUDA-graph buffer reuse
+        # on this path so later forwards cannot overwrite those live tensors.
+        self._compiled_transport = torch.compile(
+            self._transport_core,
+            dynamic=True,
+            options={"triton.cudagraphs": False},
+        )
 
     def _predict_x_heads(
         self,
@@ -741,31 +825,56 @@ class PMFActorCritic(ActorCritic):
                 f"got observations={tuple(observations.shape)}, noise={tuple(noise.shape)}"
             )
 
-        if noise.ndim == 2:
-            flat_observations = observations
-            flat_noise = noise
-        else:
-            num_samples = noise.shape[1]
-            flat_observations = (
-                observations[:, None, :]
-                .expand(batch_size, num_samples, -1)
-                .reshape(batch_size * num_samples, self.num_actor_obs)
-            )
-            flat_noise = noise.reshape(batch_size * num_samples, self.num_actions)
-
         # A pMF jump from t=1 to r=0 has h=t-r=1 and returns the x-mean head
         # exactly.  Apply actor_scale here so D_map is measured in the same
         # coordinates as the action delivered by ``act``/``act_inference``.
-        interval = torch.ones(
-            (flat_noise.shape[0], 1),
-            device=flat_noise.device,
-            dtype=flat_noise.dtype,
+        embedding = self._get_unit_time_embedding(noise)
+        samples = noise[:, None, :] if noise.ndim == 2 else noise
+        transport = (
+            self._compiled_transport if observations.is_cuda else self._transport_core
         )
-        transported, _ = self._predict_x_heads(
-            flat_observations, flat_noise, interval, actor=actor
+        transported = transport(
+            observations,
+            samples,
+            embedding,
+            self.actor if actor is None else actor,
+            self.mlp_output_scale,
+            self.actor_scale,
         )
-        transported = self.actor_scale * transported
         return transported.reshape(*noise.shape[:-1], self.num_actions)
+
+    @staticmethod
+    def _transport_core(
+        observations: torch.Tensor,
+        noise: torch.Tensor,
+        embedding: torch.Tensor,
+        actor: nn.Module,
+        mlp_output_scale: float,
+        actor_scale: float,
+    ) -> torch.Tensor:
+        """Evaluate a batch of transport samples without copying expanded obs. actor(obs,embedding,noise)"""
+        batch_size, num_samples, num_actions = noise.shape
+        inputs = torch.cat(
+            [
+                observations[:, None, :].expand(batch_size, num_samples, -1),
+                embedding[None, :, :].expand(batch_size, num_samples, -1),
+                noise,
+            ],
+            dim=-1,
+        )
+        # Flatten only after cat materializes the inputs, keeping the actor's
+        # original 2-D GEMM layout and avoiding a separate repeated-obs tensor.
+        output = actor(inputs.reshape(batch_size * num_samples, inputs.shape[-1]))
+        x_mean = mlp_output_scale * output[:, :num_actions]
+        return actor_scale * x_mean
+
+    def _sample_flow(
+        self, observations: torch.Tensor, noise: torch.Tensor
+    ) -> torch.Tensor:
+        """Use the exact transport map for a single unclamped pMF jump."""
+        if self.sampling_steps == 1 and self.pmf_time_eps <= 1.0:
+            return self.transport_actions(observations, noise)
+        return super()._sample_flow(observations, noise)
 
     def sample_transport(
         self, observations: torch.Tensor
@@ -785,7 +894,7 @@ class PMFActorCritic(ActorCritic):
             A tuple containing the sampled actions ``[batch, action_dim]``,
             transport latents ``[batch, action_dim]``, conditional means
             ``[batch, action_dim]``, and conditional action log-probabilities
-            ``[batch, 1]``. 这是干啥用的？
+            ``[batch, 1]``.
         """
         if observations.ndim != 2 or observations.shape[1] != self.num_actor_obs:
             raise ValueError(
@@ -1020,24 +1129,17 @@ class PMFActorCritic(ActorCritic):
         t_current: torch.Tensor,
         dt: torch.Tensor,
         flow_steps: int,
+        embedded_steps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Integrate pMF x-derived mean velocities from t=1 to t=0."""
         batch_size = observations.shape[0]
-        half_dim = self.timestep_embed_dim // 2
-        freqs = 2 ** torch.arange(
-            half_dim, device=observations.device, dtype=observations.dtype
-        )
+        if embedded_steps is None:
+            embedded_steps = self._embed_flow_schedule(t_current, dt)
 
         for i in range(flow_steps):
             t_value = t_current[i].reshape(1, 1)
-            # Reverse integration has dt=r-t<0, so h=t-r=-dt>0.
-            h_value = (-dt[i]).reshape(1, 1)
-            embedded_h = torch.cat(
-                [torch.cos(h_value * freqs), torch.sin(h_value * freqs)], dim=-1
-            ).expand(batch_size, -1)
-            output = self.actor(
-                torch.cat([observations, embedded_h, x_t], dim=-1)
-            )
+            embedded_h = embedded_steps[i].expand(batch_size, -1)
+            output = self.actor(torch.cat([observations, embedded_h, x_t], dim=-1))
             output = self.mlp_output_scale * output
             x_mean = output[:, : self.num_actions]
             denominator = torch.clamp(t_value, min=self.pmf_time_eps)
@@ -1045,3 +1147,9 @@ class PMFActorCritic(ActorCritic):
             x_t = x_t + mean_velocity * dt[i]
 
         return x_t
+
+    def _embed_flow_schedule(
+        self, t_current: torch.Tensor, dt: torch.Tensor
+    ) -> torch.Tensor:
+        """Cache pMF's interval embeddings, where h=t-r=-dt."""
+        return self._embed_timestep(-dt[:, None])

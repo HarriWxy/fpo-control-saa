@@ -344,12 +344,12 @@ class FPO:
         mean_entropy = 0
         mean_kl = 0
         mean_policy_regularization = 0
-        mean_policy_regularization_components: dict[str, float] = {}
+        mean_policy_regularization_components: dict[str, torch.Tensor] = {}
 
         mean_approx_kl = 0
         mean_clip_fraction = 0
         mean_flow_score = 0
-        mean_flow_components: dict[str, float] = {}
+        mean_flow_components: dict[str, torch.Tensor] = {}
         # Gradient norm tracking (kept for metrics, not histograms)
         all_grad_norms_before = []
         all_grad_norms_after = []
@@ -492,7 +492,7 @@ class FPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-                    mean_kl += kl_mean.item()
+                    mean_kl += kl_mean.detach()
 
             # Surrogate loss
             assert (
@@ -538,14 +538,11 @@ class FPO:
             )
 
             with torch.no_grad():
-                mean_approx_kl += (
-                    0.5 * raw_log_ratio.detach().square().mean().item()
-                )
+                mean_approx_kl += 0.5 * raw_log_ratio.detach().square().mean()
                 mean_clip_fraction += (
                     (torch.abs(ratio.detach() - 1.0) > self.clip_param)
                     .float()
                     .mean()
-                    .item()
                 )
 
             # Surrogate computation
@@ -618,23 +615,15 @@ class FPO:
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
-            # Track gradient norms before clipping
-            total_grad_norm_before = 0.0
-            for p in self.policy.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_grad_norm_before += param_norm.item() ** 2
-            total_grad_norm_before = total_grad_norm_before**0.5
-
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-
-            # Track gradient norms after clipping
-            total_grad_norm_after = 0.0
-            for p in self.policy.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_grad_norm_after += param_norm.item() ** 2
-            total_grad_norm_after = total_grad_norm_after**0.5
+            # Clipping already computes the total norm. Reuse it and its
+            # exact scaling coefficient instead of synchronizing per parameter.
+            total_grad_norm_before = nn.utils.clip_grad_norm_(
+                self.policy.parameters(), self.max_grad_norm
+            ).detach()
+            clip_coefficient = (
+                self.max_grad_norm / (total_grad_norm_before + 1e-6)
+            ).clamp(max=1.0)
+            total_grad_norm_after = total_grad_norm_before * clip_coefficient
 
             self.optimizer.step()
 
@@ -642,21 +631,22 @@ class FPO:
             all_grad_norms_before.append(total_grad_norm_before)
             all_grad_norms_after.append(total_grad_norm_after)
 
-            # Store the losses
-            mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
-            mean_total_loss += loss.detach().item()
-            mean_entropy += entropy_bonus.item() if entropy_bonus is not None else 0.0
-            mean_flow_score += cfm_loss_batch.detach().mean().item()
-            mean_policy_regularization += policy_regularization.detach().item()
+            # Keep detached logging scalars on the training device until the
+            # end of the update; none of these values controls optimization.
+            mean_value_loss += value_loss.detach()
+            mean_surrogate_loss += surrogate_loss.detach()
+            mean_total_loss += loss.detach()
+            mean_entropy += entropy_bonus.detach() if entropy_bonus is not None else 0.0
+            mean_flow_score += cfm_loss_batch.detach().mean()
+            mean_policy_regularization += policy_regularization.detach()
             for name, value in policy_regularization_components.items():
                 mean_policy_regularization_components[name] = (
                     mean_policy_regularization_components.get(name, 0.0)
-                    + value.detach().mean().item()
+                    + value.detach().mean()
                 )
             for name, value in flow_components.items():
                 mean_flow_components[name] = mean_flow_components.get(name, 0.0) + (
-                    value.detach().mean().item()
+                    value.detach().mean()
                 )
 
             mini_batch_step += 1
@@ -674,22 +664,23 @@ class FPO:
         for name in mean_flow_components:
             mean_flow_components[name] /= num_updates
         if self.schedule == "adaptive":
-            mean_kl /= num_updates
+            # KL is accumulated under inference_mode; avoid mutating that
+            # inference tensor after leaving the context.
+            mean_kl = mean_kl / num_updates
         mean_approx_kl /= num_updates
         mean_clip_fraction /= num_updates
         with torch.no_grad():
             returns = self.storage.returns
             values = self.storage.values
             var_y = torch.var(returns, unbiased=False)
-            if var_y.item() > 1e-8:
-                explained_variance = (
-                    1.0 - torch.var(returns - values, unbiased=False) / var_y
-                ).item()
-            else:
-                explained_variance = 0.0
+            explained_variance = torch.where(
+                var_y > 1e-8,
+                1.0 - torch.var(returns - values, unbiased=False) / var_y,
+                var_y.new_zeros(()),
+            )
             action_std = self.storage.actions.std(
                 dim=(0, 1), unbiased=False
-            ).mean().item()
+            ).mean()
 
         # Increment counters
         self.storage.clear()
@@ -728,27 +719,30 @@ class FPO:
 
         # Gradient norm metrics (scalar, not histograms)
         if all_grad_norms_before:
-            metrics_dict["mean_grad_norm_before_clip"] = np.mean(all_grad_norms_before)
-            metrics_dict["mean_grad_norm_after_clip"] = np.mean(all_grad_norms_after)
+            metrics_dict["mean_grad_norm_before_clip"] = torch.stack(
+                all_grad_norms_before
+            ).mean()
+            metrics_dict["mean_grad_norm_after_clip"] = torch.stack(
+                all_grad_norms_after
+            ).mean()
 
         # Observation normalizer scalar statistics
         if obs_normalizer is not None:
             with torch.no_grad():
-                obs_std = obs_normalizer.std.cpu()
-                metrics_dict["obs_norm_min_std"] = obs_std.min().item()
-                metrics_dict["obs_norm_max_std"] = obs_std.max().item()
-                metrics_dict["obs_norm_mean_std"] = obs_std.mean().item()
+                obs_std = obs_normalizer.std
+                metrics_dict["obs_norm_min_std"] = obs_std.min()
+                metrics_dict["obs_norm_max_std"] = obs_std.max()
+                metrics_dict["obs_norm_mean_std"] = obs_std.mean()
 
         if privileged_obs_normalizer is not None:
             with torch.no_grad():
-                priv_obs_std = privileged_obs_normalizer.std.cpu()
-                metrics_dict["privileged_obs_norm_min_std"] = priv_obs_std.min().item()
-                metrics_dict["privileged_obs_norm_max_std"] = priv_obs_std.max().item()
-                metrics_dict["privileged_obs_norm_mean_std"] = (
-                    priv_obs_std.mean().item()
-                )
+                priv_obs_std = privileged_obs_normalizer.std
+                metrics_dict["privileged_obs_norm_min_std"] = priv_obs_std.min()
+                metrics_dict["privileged_obs_norm_max_std"] = priv_obs_std.max()
+                metrics_dict["privileged_obs_norm_mean_std"] = priv_obs_std.mean()
 
         # Add metrics to loss_dict under "metrics" key
+        self._metrics_to_cpu(loss_dict, metrics_dict)
         loss_dict["metrics"] = metrics_dict
 
         return loss_dict
@@ -834,6 +828,25 @@ class FPO:
                     all_grads[offset : offset + numel].view_as(param.grad.data)
                 )
                 offset += numel
+
+    @staticmethod
+    def _metrics_to_cpu(*groups: dict[str, float | int | torch.Tensor]) -> None:
+        """Replace tensor logging scalars using one host transfer per device.
+
+        Keeping Python values intact preserves integer counters. Device groups
+        also support optional normalizers living on a different device.
+        """
+        entries_by_device: dict[torch.device, list[tuple[dict, str, torch.Tensor]]] = {}
+        for group in groups:
+            for name, value in group.items():
+                if isinstance(value, torch.Tensor):
+                    entries_by_device.setdefault(value.device, []).append(
+                        (group, name, value.detach())
+                    )
+        for entries in entries_by_device.values():
+            values = torch.stack([value for _, _, value in entries]).cpu().tolist()
+            for (group, name, _), value in zip(entries, values):
+                group[name] = value
 
 
 class IMFFPO(FPO):
