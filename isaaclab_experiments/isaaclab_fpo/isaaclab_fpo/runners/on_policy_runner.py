@@ -258,6 +258,8 @@ class OnPolicyRunner:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.perf_counter()
+            if isinstance(self.alg, FSPPOJoint):
+                self.alg.begin_rollout(self.tot_timesteps)
             # Initialize timing accumulators
             env_step_time = 0.0
             action_time = 0.0

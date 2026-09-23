@@ -883,9 +883,9 @@ class PMFActorCritic(ActorCritic):
 
         This interface represents the rollout distribution as a joint sample
         of a standard-normal transport latent and a fixed-variance conditional
-        Gaussian action.  The latent prior is intentionally not part of the
-        returned log-probability: it cancels when an old and a new policy are
-        evaluated at the stored latent.
+        Gaussian action for the current rollout. The latent prior is
+        intentionally not part of the returned log-probability: it cancels
+        when old and new policies are evaluated at the stored latent.
 
         Args:
             observations: Policy observations with shape ``[batch, obs_dim]``.
@@ -951,7 +951,7 @@ class PMFActorCritic(ActorCritic):
         ).sum(dim=-1, keepdim=True)
 
     def _conditional_action_std(self) -> float:
-        """Return the finite, positive fixed action-noise standard deviation."""
+        """Return the finite, positive action-noise standard deviation."""
         action_std = float(self.action_perturb_std)
         if not math.isfinite(action_std) or action_std <= 0.0:
             raise ValueError(

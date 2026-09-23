@@ -375,8 +375,9 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     fsppo_joint_kl_target: float = 0.01
     """Target upper bound for FSPPOJoint's mean joint conditional-Gaussian KL.
 
-    With a fixed action perturbation standard deviation ``sigma``, the
-    same-noise map estimate obeys ``joint_kl = D_map / (2 * sigma**2)``.
+    With a fixed action perturbation standard deviation ``sigma`` within each
+    rollout and update, the same-noise map estimate obeys
+    ``joint_kl = D_map / (2 * sigma**2)``.
     FSPPOJoint uses this target for candidate acceptance and its dual update.
     """
 
@@ -413,6 +414,21 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     """Optional pMF regression auxiliary-loss coefficient for FSPPOJoint.
 
     The default leaves the exact joint-Gaussian PPO objective unmodified.
+    """
+
+    action_perturb_std_final: float | None = None
+    """Final public-action Gaussian noise standard deviation for FSPPOJoint.
+
+    ``None`` keeps ``policy.action_perturb_std`` fixed. When set with a positive
+    ``action_perturb_std_decay_env_steps``, the runner linearly anneals from the
+    policy value to this value between rollout boundaries.
+    """
+
+    action_perturb_std_decay_env_steps: int = 0
+    """Global environment transitions over which to anneal action noise.
+
+    A value of zero disables annealing. This schedule only applies to
+    FSPPOJoint and is held constant for each complete rollout and its PPO update.
     """
 
     fsppo_joint_endpoint_mae_coef: float = 0.1

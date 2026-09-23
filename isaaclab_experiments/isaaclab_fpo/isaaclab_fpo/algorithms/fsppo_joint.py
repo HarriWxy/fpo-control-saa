@@ -21,8 +21,9 @@ class FSPPOJoint(FPO):
 
     Rollouts retain the actual generating latent and raw, perturbed action.
     The Gaussian conditional log-ratio is therefore exact for the joint policy;
-    it is not the marginal action log-ratio.  At fixed positive sigma, the
-    same-latent map cost divided by ``2 * sigma**2`` is the joint KL and an
+    it is not the marginal action log-ratio. With sigma held positive and
+    fixed for each rollout and its update, the same-latent map cost divided by
+    ``2 * sigma**2`` is the joint KL and an
     upper bound on marginal action KL, in expectation over the prior.
 
     When the budget is enabled, every candidate optimizer step is checked on
@@ -66,6 +67,32 @@ class FSPPOJoint(FPO):
         if cfg.schedule != "fixed" or cfg.trust_region_mode != "ppo":
             raise ValueError(
                 "FSPPOJoint requires schedule='fixed' and trust_region_mode='ppo'"
+            )
+        decay_env_steps = cfg.action_perturb_std_decay_env_steps
+        if (
+            isinstance(decay_env_steps, bool)
+            or not isinstance(decay_env_steps, int)
+            or decay_env_steps < 0
+        ):
+            raise ValueError(
+                "action_perturb_std_decay_env_steps must be a non-negative integer"
+            )
+        final_action_std = cfg.action_perturb_std_final
+        if final_action_std is None:
+            if decay_env_steps > 0:
+                raise ValueError(
+                    "action_perturb_std_final must be set when action-noise decay is enabled"
+                )
+            final_action_std = float(policy.action_perturb_std)
+        if not math.isfinite(final_action_std) or final_action_std <= 0:
+            raise ValueError("action_perturb_std_final must be finite and positive")
+        if final_action_std > policy.action_perturb_std:
+            raise ValueError(
+                "action_perturb_std_final must not exceed the initial action_perturb_std"
+            )
+        if decay_env_steps == 0 and final_action_std != policy.action_perturb_std:
+            raise ValueError(
+                "set action_perturb_std_decay_env_steps to anneal action noise"
             )
         if cfg.knn_entropy_coef != 0 or cfg.storage_action_noise_std != 0:
             raise ValueError(
@@ -112,7 +139,12 @@ class FSPPOJoint(FPO):
         torch.set_float32_matmul_precision("highest")
         super().__init__(policy, cfg, device=device)
         self.transition = JointRolloutStorage.Transition()
-        self.sigma = float(policy.action_perturb_std)
+        self.initial_sigma = float(policy.action_perturb_std)
+        self.final_sigma = float(final_action_std)
+        self.sigma_decay_env_steps = decay_env_steps
+        self.sigma = self.initial_sigma
+        self.action_noise_schedule_progress = 0.0
+        self.action_noise_completed_env_steps = 0
         self.enable_budget = bool(cfg.fsppo_joint_enable_budget)
         self.kl_target = cfg.fsppo_joint_kl_target
         self.kl_coefficient = (
@@ -127,6 +159,30 @@ class FSPPOJoint(FPO):
         self.aux_loss_coef = cfg.fsppo_joint_aux_loss_coef
         self._sampler_contract = self._current_sampler_contract()
         self._old_actor = copy.deepcopy(self.policy.actor).requires_grad_(False).eval()
+
+    def begin_rollout(self, completed_env_steps: int) -> None:
+        """Set the fixed conditional Gaussian scale for the next rollout.
+
+        The schedule advances only at a rollout boundary. Each collected batch
+        and its subsequent PPO update therefore use the same Gaussian scale.
+        """
+        if (
+            isinstance(completed_env_steps, bool)
+            or not isinstance(completed_env_steps, int)
+            or completed_env_steps < 0
+        ):
+            raise ValueError("completed_env_steps must be a non-negative integer")
+        self._check_sampler_contract()
+        self.action_noise_completed_env_steps = completed_env_steps
+        if self.sigma_decay_env_steps > 0:
+            progress = min(completed_env_steps / self.sigma_decay_env_steps, 1.0)
+        else:
+            progress = 0.0
+        self.action_noise_schedule_progress = progress
+        self.sigma = self.initial_sigma + progress * (
+            self.final_sigma - self.initial_sigma
+        )
+        self.policy.action_perturb_std = self.sigma
 
     def init_storage(
         self,
@@ -284,6 +340,11 @@ class FSPPOJoint(FPO):
             "explained_variance": explained,
             "action_std": action_std,
             "joint/action_noise_std": self.sigma,
+            "joint/action_noise_variance": self.sigma**2,
+            "joint/action_noise_schedule_progress": self.action_noise_schedule_progress,
+            "joint/action_noise_completed_env_steps": (
+                self.action_noise_completed_env_steps
+            ),
             "joint/budget_enabled": float(self.enable_budget),
             "joint/kl_coefficient_used": coefficient_used,
             "joint/kl_coefficient_next": self.kl_coefficient,
@@ -326,22 +387,32 @@ class FSPPOJoint(FPO):
         return loss_dict
 
     def _current_sampler_contract(self) -> dict:
-        return {
+        contract = {
             "float32_matmul_precision": torch.get_float32_matmul_precision(),
             "num_actor_obs": self.policy.num_actor_obs,
             "num_actions": self.policy.num_actions,
             "timestep_embed_dim": self.policy.timestep_embed_dim,
-            "action_perturb_std": float(self.policy.action_perturb_std),
+            "action_perturb_std": self.initial_sigma,
             "actor_scale": float(self.policy.actor_scale),
             "actor_mlp_output_scale": float(self.policy.mlp_output_scale),
             "sampling_steps": self.policy.sampling_steps,
             "pmf_time_eps": float(self.policy.pmf_time_eps),
         }
+        if self.sigma_decay_env_steps > 0:
+            contract["action_perturb_std_final"] = self.final_sigma
+            contract["action_perturb_std_decay_env_steps"] = (
+                self.sigma_decay_env_steps
+            )
+        return contract
 
     def _check_sampler_contract(self) -> None:
         if self._current_sampler_contract() != self._sampler_contract:
             raise ValueError(
-                "FSPPOJoint sampling parameters must remain fixed throughout training"
+                "FSPPOJoint sampler dimensions and noise schedule must remain fixed"
+            )
+        if float(self.policy.action_perturb_std) != self.sigma:
+            raise ValueError(
+                "FSPPOJoint action noise may only change at a rollout boundary"
             )
 
     @torch.no_grad()
