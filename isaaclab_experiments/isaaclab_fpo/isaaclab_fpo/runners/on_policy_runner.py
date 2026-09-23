@@ -15,7 +15,14 @@ from typing import TYPE_CHECKING
 import torch
 
 import isaaclab_fpo
-from isaaclab_fpo.algorithms import FPO, FSPPO, IMFFPO, PMFFPO, FSPPOJoint
+from isaaclab_fpo.algorithms import (
+    FPO,
+    FSPPO,
+    FSPPOJoint,
+    FSPPOJointEndpoint,
+    IMFFPO,
+    PMFFPO,
+)
 
 if TYPE_CHECKING:
     from isaaclab_fpo.rl_cfg import FpoRslRlOnPolicyRunnerCfg
@@ -72,6 +79,7 @@ class OnPolicyRunner:
             "FPO": FPO,
             "FSPPO": FSPPO,
             "FSPPOJoint": FSPPOJoint,
+            "FSPPOJointEndpoint": FSPPOJointEndpoint,
             "IMFFPO": IMFFPO,
             "PMFFPO": PMFFPO,
         }
@@ -94,7 +102,7 @@ class OnPolicyRunner:
         allowed_algorithms = {
             ActorCritic: (FPO,),
             IMFActorCritic: (IMFFPO,),
-            PMFActorCritic: (PMFFPO, FSPPO, FSPPOJoint),
+            PMFActorCritic: (PMFFPO, FSPPO, FSPPOJoint, FSPPOJointEndpoint),
         }
         if algorithm_class not in allowed_algorithms[policy_class]:
             allowed_names = sorted(
@@ -597,8 +605,8 @@ class OnPolicyRunner:
         print(log_string)
 
     def _is_fsppo_joint(self) -> bool:
-        """Whether this runner has the checkpoint contract of FSPPOJoint."""
-        return isinstance(self.alg, FSPPOJoint)
+        """Whether this runner has a joint-latent endpoint checkpoint contract."""
+        return isinstance(self.alg, (FSPPOJoint, FSPPOJointEndpoint))
 
     @staticmethod
     def _clone_state_dict(state_dict: dict) -> dict:

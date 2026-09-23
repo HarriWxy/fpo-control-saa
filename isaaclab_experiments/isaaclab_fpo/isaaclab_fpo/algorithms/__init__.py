@@ -7,5 +7,13 @@
 
 from .fpo import FPO, FSPPO, IMFFPO, PMFFPO
 from .fsppo_joint import FSPPOJoint
+from .fsppo_joint_endpoint import FSPPOJointEndpoint
 
-__all__ = ["FPO", "FSPPO", "IMFFPO", "PMFFPO", "FSPPOJoint"]
+__all__ = [
+    "FPO",
+    "FSPPO",
+    "IMFFPO",
+    "PMFFPO",
+    "FSPPOJoint",
+    "FSPPOJointEndpoint",
+]

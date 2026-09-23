@@ -158,6 +158,21 @@ def test_default_update_never_evaluates_pmf_score(monkeypatch):
     assert alg.storage.step == 0
 
 
+def test_no_budget_mode_applies_all_steps_at_configured_learning_rate():
+    alg = make_algorithm(fsppo_joint_enable_budget=False)
+    collect(alg)
+    results = alg.update()
+
+    assert results["metrics"]["joint/budget_enabled"] == 0.0
+    assert results["metrics"]["joint/accepted_updates"] == 4
+    assert results["metrics"]["joint/rejected_candidates"] == 0
+    assert results["metrics"]["joint/early_stop"] == 0.0
+    assert results["metrics"]["joint/last_step_learning_rate"] == 1e-3
+    assert results["map_kl_loss"] == 0.0
+    assert results["metrics"]["joint/kl_coefficient_used"] == 0.0
+    assert results["metrics"]["joint/kl_coefficient_next"] == 0.0
+
+
 def test_auxiliary_regression_is_separate_positive_loss():
     alg = make_algorithm(fsppo_joint_aux_loss_coef=0.1)
     collect(alg)

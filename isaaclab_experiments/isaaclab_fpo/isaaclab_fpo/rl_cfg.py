@@ -182,7 +182,11 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     """Configuration for the FPO (Flow Policy Optimization) algorithm."""
 
     class_name: str = "FPO"
-    """Algorithm class name (``FPO``, ``IMFFPO``, ``PMFFPO``, ``FSPPO`` or ``FSPPOJoint``)."""
+    """Algorithm class name for the selected policy optimization variant.
+
+    Supported names include ``FPO``, ``IMFFPO``, ``PMFFPO``, ``FSPPO``,
+    ``FSPPOJoint``, and ``FSPPOJointEndpoint``.
+    """
 
     num_learning_epochs: int = 16
     """The number of learning epochs per update. Default is 16.
@@ -376,6 +380,14 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     FSPPOJoint uses this target for candidate acceptance and its dual update.
     """
 
+    fsppo_joint_enable_budget: bool = True
+    """Whether to enforce FSPPOJoint's hard/soft transport-map budget.
+
+    When disabled, candidate steps are applied at the configured learning rate
+    without backtracking or rejection, and the map-KL penalty/dual update are
+    disabled.  This is intended for a controlled no-budget ablation.
+    """
+
     fsppo_joint_kl_coef: float = 1.0
     """Initial non-negative coefficient of FSPPOJoint's map-KL penalty."""
 
@@ -401,6 +413,14 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     """Optional pMF regression auxiliary-loss coefficient for FSPPOJoint.
 
     The default leaves the exact joint-Gaussian PPO objective unmodified.
+    """
+
+    fsppo_joint_endpoint_mae_coef: float = 0.1
+    """Coefficient of the terminal-action MAE in ``FSPPOJointEndpoint``.
+
+    The endpoint comparison uses the one-NFE pMF terminal action directly and
+    does not use the joint map-budget fields or ``fsppo_joint_map_samples``.
+    This field is ignored by the other algorithm variants.
     """
 
     ema_decay: float = 0.95

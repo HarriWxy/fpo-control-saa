@@ -25,12 +25,14 @@ class FSPPOJoint(FPO):
     same-latent map cost divided by ``2 * sigma**2`` is the joint KL and an
     upper bound on marginal action KL, in expectation over the prior.
 
-    Every candidate optimizer step is checked on one fixed probe set for this
-    rollout.  A rejected candidate restores BOTH model and optimizer state and
-    retries with a smaller step size.  This enforces only the empirical probe
-    mean budget, not a population or all-state bound.  A fresh probe at the end
-    measures generalization of that budget.  Optional pMF regression is a
-    positive auxiliary loss and never participates in the policy ratio.
+    When the budget is enabled, every candidate optimizer step is checked on
+    one fixed probe set for this rollout.  A rejected candidate restores BOTH
+    model and optimizer state and retries with a smaller step size.  This
+    enforces only the empirical probe mean budget, not a population or all-state
+    bound.  A fresh probe at the end measures generalization of that budget.
+    The budget can be disabled for a controlled no-budget ablation.  Optional
+    pMF regression is a positive auxiliary loss and never participates in the
+    policy ratio.
     """
 
     def __init__(
@@ -111,8 +113,11 @@ class FSPPOJoint(FPO):
         super().__init__(policy, cfg, device=device)
         self.transition = JointRolloutStorage.Transition()
         self.sigma = float(policy.action_perturb_std)
+        self.enable_budget = bool(cfg.fsppo_joint_enable_budget)
         self.kl_target = cfg.fsppo_joint_kl_target
-        self.kl_coefficient = cfg.fsppo_joint_kl_coef
+        self.kl_coefficient = (
+            cfg.fsppo_joint_kl_coef if self.enable_budget else 0.0
+        )
         self.dual_lr = cfg.fsppo_joint_dual_lr
         self.kl_coefficient_max = cfg.fsppo_joint_kl_coef_max
         self.map_samples = cfg.fsppo_joint_map_samples
@@ -162,6 +167,7 @@ class FSPPOJoint(FPO):
         """Save adaptive penalty and the fixed sampling contract for resume."""
         return {
             "version": 1,
+            "budget_enabled": self.enable_budget,
             "kl_coefficient": self.kl_coefficient,
             "update_counter": self.update_counter,
             "tot_timesteps": self.tot_timesteps,
@@ -172,6 +178,9 @@ class FSPPOJoint(FPO):
         """Reject incompatible sampling distributions before resuming."""
         if state.get("version") != 1 or state.get("sampler") != self._sampler_contract:
             raise ValueError("FSPPOJoint checkpoint sampling contract mismatch")
+        # Checkpoints written before this flag existed used the budget path.
+        if bool(state.get("budget_enabled", True)) != self.enable_budget:
+            raise ValueError("FSPPOJoint checkpoint budget mode mismatch")
         coefficient = float(state["kl_coefficient"])
         if (
             not math.isfinite(coefficient)
@@ -182,12 +191,12 @@ class FSPPOJoint(FPO):
             value = state[name]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Invalid FSPPOJoint checkpoint {name}")
-        self.kl_coefficient = coefficient
+        self.kl_coefficient = coefficient if self.enable_budget else 0.0
         self.update_counter = state["update_counter"]
         self.tot_timesteps = state["tot_timesteps"]
 
     def update(self, obs_normalizer=None, privileged_obs_normalizer=None) -> dict:
-        """Run PPO updates with transactional, post-step probe-budget checks."""
+        """Run PPO updates with optional transactional probe-budget checks."""
         del (
             obs_normalizer,
             privileged_obs_normalizer,
@@ -203,7 +212,7 @@ class FSPPOJoint(FPO):
         totals: dict[str, torch.Tensor] = {}
         accepted = rejected = attempted = 0
         last_step_lr = 0.0
-        coefficient_used = self.kl_coefficient
+        coefficient_used = self.kl_coefficient if self.enable_budget else 0.0
         for batch in self.storage.mini_batch_generator(
             self.num_mini_batches, self.num_learning_epochs
         ):
@@ -244,15 +253,18 @@ class FSPPOJoint(FPO):
                 raise FloatingPointError(
                     "Non-finite FSPPOJoint fresh rollout map audit"
                 )
-            audit_mean = float(audit_kl.mean())
-            self.kl_coefficient = min(
-                self.kl_coefficient_max,
-                max(
-                    0.0,
-                    self.kl_coefficient
-                    + self.dual_lr * (audit_mean / self.kl_target - 1.0),
-                ),
-            )
+            if self.enable_budget:
+                audit_mean = float(audit_kl.mean())
+                self.kl_coefficient = min(
+                    self.kl_coefficient_max,
+                    max(
+                        0.0,
+                        self.kl_coefficient
+                        + self.dual_lr * (audit_mean / self.kl_target - 1.0),
+                    ),
+                )
+            else:
+                self.kl_coefficient = 0.0
             variance = self.storage.returns.var(unbiased=False)
             explained = torch.where(
                 variance > 1e-8,
@@ -272,6 +284,7 @@ class FSPPOJoint(FPO):
             "explained_variance": explained,
             "action_std": action_std,
             "joint/action_noise_std": self.sigma,
+            "joint/budget_enabled": float(self.enable_budget),
             "joint/kl_coefficient_used": coefficient_used,
             "joint/kl_coefficient_next": self.kl_coefficient,
             "joint/kl_target": self.kl_target,
@@ -410,7 +423,11 @@ class FSPPOJoint(FPO):
             old_map = self.policy.transport_actions(obs, noise, actor=self._old_actor)
         map_kl = (current_map - old_map).absolute().sum(dim=-1).mean()
         aux_loss, aux_metrics = self._auxiliary_loss(obs, actions)
-        penalty = self.kl_coefficient * map_kl
+        penalty = (
+            self.kl_coefficient * map_kl
+            if self.enable_budget
+            else map_kl.new_zeros(())
+        )
         weighted_aux = self.aux_loss_coef * aux_loss
         loss = surrogate + self.value_loss_coef * value_loss + penalty + weighted_aux
         statistics = {
@@ -459,6 +476,11 @@ class FSPPOJoint(FPO):
         self, probe: dict[str, torch.Tensor]
     ) -> tuple[bool, int, float]:
         """Try one gradient at smaller step sizes, rolling back rejected trials."""
+        if not self.enable_budget:
+            learning_rate = float(self.optimizer.param_groups[0]["lr"])
+            self.optimizer.step()
+            return True, 0, learning_rate
+
         model_state = copy.deepcopy(self.policy.state_dict())
         optimizer_state = copy.deepcopy(self.optimizer.state_dict())
         base_lrs = [group["lr"] for group in self.optimizer.param_groups]
