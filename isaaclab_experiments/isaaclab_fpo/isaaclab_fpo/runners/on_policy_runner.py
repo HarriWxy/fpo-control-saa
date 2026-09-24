@@ -226,7 +226,7 @@ class OnPolicyRunner:
         # start learning
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
-        obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+        obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device) # privileged_obs is for critic
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping

@@ -301,15 +301,15 @@ class FSPPOJoint(FPO):
                 totals[name] = totals.get(name, 0.0) + value.detach()
 
         with torch.no_grad():
-            probe_kl = self._probe_kl(probe)
-            # New states/noises are drawn AFTER all updates; these diagnostics
-            # are not reused for acceptance or described as a hard guarantee.
-            audit_kl = self._probe_kl(self._make_probe())
-            if not torch.isfinite(audit_kl).all():
-                raise FloatingPointError(
-                    "Non-finite FSPPOJoint fresh rollout map audit"
-                )
             if self.enable_budget:
+                probe_kl = self._probe_l1(probe)
+                # New states/noises are drawn AFTER all updates; these diagnostics
+                # are not reused for acceptance or described as a hard guarantee.
+                audit_kl = self._probe_l1(self._make_probe())
+                if not torch.isfinite(audit_kl).all():
+                    raise FloatingPointError(
+                        "Non-finite FSPPOJoint fresh rollout map audit"
+                    )
                 audit_mean = float(audit_kl.mean())
                 self.kl_coefficient = min(
                     self.kl_coefficient_max,
@@ -320,7 +320,8 @@ class FSPPOJoint(FPO):
                     ),
                 )
             else:
-                self.kl_coefficient = 0.0
+                # self.kl_coefficient = 0.0
+                pass
             variance = self.storage.returns.var(unbiased=False)
             explained = torch.where(
                 variance > 1e-8,
@@ -361,14 +362,15 @@ class FSPPOJoint(FPO):
             "mean_grad_norm_before_clip": means.get("mean_grad_norm_before_clip", 0.0),
             "mean_grad_norm_after_clip": means.get("mean_grad_norm_after_clip", 0.0),
         }
-        for name, samples in (("probe", probe_kl), ("audit", audit_kl)):
-            mean = samples.mean()
-            metrics[f"joint/{name}_kl_mean"] = mean
-            metrics[f"joint/{name}_kl_p95"] = torch.quantile(samples.flatten(), 0.95)
-            metrics[f"joint/{name}_kl_max"] = samples.max()
-            metrics[f"joint/{name}_map_distance"] = (
-                mean * 2 * self.sigma**2
-            )
+        if self.enable_budget:
+            for name, samples in (("probe", probe_kl), ("audit", audit_kl)):
+                mean = samples.mean()
+                metrics[f"joint/{name}_kl_mean"] = mean
+                metrics[f"joint/{name}_kl_p95"] = torch.quantile(samples.flatten(), 0.95)
+                metrics[f"joint/{name}_kl_max"] = samples.max()
+                metrics[f"joint/{name}_map_distance"] = (
+                    mean * 2 * self.sigma**2
+                )
         for name in ("aux_u_loss", "aux_v_loss", "aux_jvp_norm"):
             if name in means:
                 metrics[f"joint/{name}"] = means[name]
@@ -438,19 +440,22 @@ class FSPPOJoint(FPO):
 
     @torch.no_grad()
     def _make_probe(self) -> dict[str, torch.Tensor]:
-        observations = self.storage.observations.flatten(0, 1)
-        indices = torch.randperm(observations.shape[0], device=self.device)[
-            : self.probe_size
-        ]
-        obs = observations[indices]
-        noise = torch.randn(
-            obs.shape[0], self.map_samples, self.policy.num_actions, device=self.device
-        )
-        old_actions = self.policy.transport_actions(obs, noise, actor=self._old_actor)
-        return {"obs": obs, "noise": noise, "old_actions": old_actions}
+        if self.enable_budget:
+            observations = self.storage.observations.flatten(0, 1)
+            indices = torch.randperm(observations.shape[0], device=self.device)[
+                : self.probe_size
+            ]
+            obs = observations[indices]
+            noise = torch.randn(
+                obs.shape[0], self.map_samples, self.policy.num_actions, device=self.device
+            )
+            old_actions = self.policy.transport_actions(obs, noise, actor=self._old_actor)
+            return {"obs": obs, "noise": noise, "old_actions": old_actions}
+        else:
+            return {"obs": torch.empty(0), "noise": torch.empty(0), "old_actions": torch.empty(0)}
 
     @torch.no_grad()
-    def _probe_kl(self, probe: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _probe_l1(self, probe: dict[str, torch.Tensor]) -> torch.Tensor:
         """Wasserstein distance between current and old transport actions."""
         actions: torch.Tensor = self.policy.transport_actions(probe["obs"], probe["noise"])
         return ((actions - probe["old_actions"])).absolute().sum(dim=-1)
@@ -563,7 +568,7 @@ class FSPPOJoint(FPO):
             for group, lr in zip(self.optimizer.param_groups, base_lrs):
                 group["lr"] = lr * factor
             self.optimizer.step()
-            kl = self._probe_kl(probe)
+            kl = self._probe_l1(probe)
             finite_parameters = bool(
                 torch.stack(
                     [torch.isfinite(p).all() for p in self.policy.parameters()]

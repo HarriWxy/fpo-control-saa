@@ -212,7 +212,7 @@ def test_backtracking_can_accept_smaller_first_step_and_restores_base_learning_r
     alg.policy.actor[-1].bias[:2].sum().backward()
     accepted, rejected, lr = alg._step_with_budget(probe)
     assert accepted and rejected > 0 and 0 < lr < 0.1
-    assert float(alg._probe_kl(probe).mean()) <= alg.kl_target
+    assert float(alg._probe_l1(probe).mean()) <= alg.kl_target
     assert alg.optimizer.param_groups[0]["lr"] == 0.1
     # Rejected Adam trials must not accumulate optimizer steps.
     assert all(float(state["step"]) == 1 for state in alg.optimizer.state.values())
