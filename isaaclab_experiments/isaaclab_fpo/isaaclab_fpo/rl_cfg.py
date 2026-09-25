@@ -416,6 +416,14 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     The default leaves the exact joint-Gaussian PPO objective unmodified.
     """
 
+    fsppo_joint_adv_v_loss_coef: float = 0.0
+    """Weight for positive-advantage pMF instantaneous-velocity regression.
+
+    Per-action v losses are averaged over flow samples and weighted by detached
+    positive PPO advantages. This is a separate auxiliary loss and does not
+    change the joint-Gaussian importance ratio.
+    """
+
     action_perturb_std_final: float | None = None
     """Final public-action Gaussian noise standard deviation for FSPPOJoint.
 

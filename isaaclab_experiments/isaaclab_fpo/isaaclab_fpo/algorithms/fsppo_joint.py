@@ -504,7 +504,7 @@ class FSPPOJoint(FPO):
             if self.enable_budget
             else map_kl.new_zeros(())
         )
-        weighted_aux = self.aux_loss_coef * aux_loss
+        weighted_aux = - self.aux_loss_coef * aux_loss * advantages
         loss = surrogate + self.value_loss_coef * value_loss + penalty + weighted_aux
         statistics = {
             "surrogate_loss": surrogate,

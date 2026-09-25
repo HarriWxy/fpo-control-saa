@@ -1111,6 +1111,61 @@ class PMFActorCritic(ActorCritic):
             return score, x1_pred, x0_pred, components
         return score, x1_pred, x0_pred
 
+    def get_pmf_v_loss(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        eps: torch.Tensor,
+        t: torch.Tensor,
+        actor: torch.nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Compute per-sample instantaneous-velocity regression losses.
+
+        This avoids the mean-flow JVP when only the pMF v-head loss is needed.
+
+        Args:
+            observations: Policy observations with shape [batch, obs_dim].
+            actions: Public actions with shape [batch, action_dim].
+            eps: Noise samples with shape [batch, samples, action_dim].
+            t: Upper time endpoints with shape [batch, samples, 1].
+            actor: Optional actor module, primarily useful for evaluation.
+
+        Returns:
+            Per-action, per-noise-sample squared errors with shape [batch, samples].
+        """
+        if actor is None:
+            actor = self.actor
+
+        batch_size, action_dim = actions.shape
+        assert observations.shape == (batch_size, self.num_actor_obs)
+        assert action_dim == self.num_actions
+        n_samples_per_action = eps.shape[1]
+        expected_noise_shape = (batch_size, n_samples_per_action, action_dim)
+        expected_time_shape = (batch_size, n_samples_per_action, 1)
+        assert eps.shape == expected_noise_shape
+        assert t.shape == expected_time_shape
+
+        scaled_actions = actions / self.actor_scale
+        x_t = t * eps + (1.0 - t) * scaled_actions[:, None, :]
+        target_velocity = (x_t - scaled_actions[:, None, :]) / torch.clamp(
+            t, min=self.pmf_time_eps
+        )
+
+        flat_size = batch_size * n_samples_per_action
+        flat_observations = (
+            observations[:, None, :]
+            .expand(batch_size, n_samples_per_action, -1)
+            .reshape(flat_size, self.num_actor_obs)
+        )
+        flat_x_t = x_t.reshape(flat_size, action_dim)
+        flat_t = t.reshape(flat_size, 1)
+        flat_target = target_velocity.reshape(flat_size, action_dim)
+        _, instantaneous_velocity = self._predict_u_and_v(
+            flat_observations, flat_x_t, flat_t, flat_t, actor=actor
+        )
+        loss = self._compute_squared_error(instantaneous_velocity, flat_target)
+        return loss.reshape(batch_size, n_samples_per_action)
+
     def flow_step(
         self,
         observations: torch.Tensor,
