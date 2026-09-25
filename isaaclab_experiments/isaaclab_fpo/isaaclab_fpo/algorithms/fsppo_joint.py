@@ -504,7 +504,7 @@ class FSPPOJoint(FPO):
             if self.enable_budget
             else map_kl.new_zeros(())
         )
-        weighted_aux = - self.aux_loss_coef * aux_loss * advantages
+        weighted_aux = torch.mean(self.aux_loss_coef * aux_loss * advantages)
         loss = surrogate + self.value_loss_coef * value_loss + penalty + weighted_aux
         statistics = {
             "surrogate_loss": surrogate,
@@ -542,7 +542,7 @@ class FSPPOJoint(FPO):
         score, _, _, components = self.policy.get_pmf_loss(
             obs, actions, eps, r, t, return_components=True
         )
-        return score.mean(), {
+        return score, {
             "aux_u_loss": components["u_loss"].mean(),
             "aux_v_loss": components["v_loss"].mean(),
             "aux_jvp_norm": components["jvp_norm"].mean(),
