@@ -1,4 +1,4 @@
-"""One-step latent Gaussian PPO with an empirical transport-map KL budget."""
+"""One-step latent Gaussian PPO with optional conditional-policy budgets."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab_fpo.algorithms.fpo import FPO
-from isaaclab_fpo.modules import PMFActorCritic
+from isaaclab_fpo.modules import GaussianResidualPMFActorCritic, PMFActorCritic
 from isaaclab_fpo.storage.joint_rollout_storage import JointRolloutStorage
 
 if TYPE_CHECKING:
@@ -22,9 +22,11 @@ class FSPPOJoint(FPO):
     Rollouts retain the actual generating latent and raw, perturbed action.
     The Gaussian conditional log-ratio is therefore exact for the joint policy;
     it is not the marginal action log-ratio. With sigma held positive and
-    fixed for each rollout and its update, the same-latent map cost divided by
-    ``2 * sigma**2`` is the joint KL and an
-    upper bound on marginal action KL, in expectation over the prior.
+    fixed for each rollout and its update, the squared same-latent map cost
+    divided by ``2 * sigma**2`` is the joint KL. The Gaussian-residual policy
+    instead permits a learned diagonal scale and uses its full Gaussian KL.
+    Both KLs bound marginal action KL in expectation over the prior. The
+    legacy PMF policy retains its historical L1 map budget for compatibility.
 
     When the budget is enabled, every candidate optimizer step is checked on
     one fixed probe set for this rollout.  A rejected candidate restores BOTH
@@ -44,7 +46,7 @@ class FSPPOJoint(FPO):
         multi_gpu_cfg: dict | None = None,
     ):
         if not isinstance(policy, PMFActorCritic):
-            raise TypeError("FSPPOJoint requires policy.class_name='PMFActorCritic'")
+            raise TypeError("FSPPOJoint requires a PMFActorCritic policy")
         if multi_gpu_cfg is not None:
             raise ValueError(
                 "FSPPOJoint currently supports a single learner device only"
@@ -69,6 +71,19 @@ class FSPPOJoint(FPO):
                 "FSPPOJoint requires schedule='fixed' and trust_region_mode='ppo'"
             )
         decay_env_steps = cfg.action_perturb_std_decay_env_steps
+        self.gaussian_residual_policy = isinstance(
+            policy, GaussianResidualPMFActorCritic
+        )
+        self.learn_action_std = (
+            self.gaussian_residual_policy and policy.learn_action_perturb_std
+        )
+        if self.learn_action_std and (
+            decay_env_steps != 0 or cfg.action_perturb_std_final is not None
+        ):
+            raise ValueError(
+                "Learned action noise requires action_perturb_std_decay_env_steps=0 "
+                "and action_perturb_std_final=None"
+            )
         if (
             isinstance(decay_env_steps, bool)
             or not isinstance(decay_env_steps, int)
@@ -105,6 +120,7 @@ class FSPPOJoint(FPO):
             "fsppo_joint_dual_lr",
             "fsppo_joint_kl_coef_max",
             "fsppo_joint_aux_loss_coef",
+            "fsppo_joint_entropy_coef",
         ):
             value = getattr(cfg, name)
             if not math.isfinite(value) or value < 0:
@@ -131,6 +147,24 @@ class FSPPOJoint(FPO):
             )
         if not 0 < cfg.fsppo_joint_backtrack_factor < 1:
             raise ValueError("fsppo_joint_backtrack_factor must be in (0, 1)")
+        if cfg.fsppo_joint_aux_weighting not in ("uniform", "advantage_exp"):
+            raise ValueError(
+                "fsppo_joint_aux_weighting must be 'uniform' or 'advantage_exp'"
+            )
+        if cfg.fsppo_joint_aux_target not in ("actions", "means"):
+            raise ValueError("fsppo_joint_aux_target must be 'actions' or 'means'")
+        if (
+            not math.isfinite(cfg.fsppo_joint_aux_temperature)
+            or cfg.fsppo_joint_aux_temperature <= 0
+        ):
+            raise ValueError("fsppo_joint_aux_temperature must be finite and positive")
+        if (
+            not math.isfinite(cfg.fsppo_joint_aux_weight_clip)
+            or cfg.fsppo_joint_aux_weight_clip < 1
+        ):
+            raise ValueError(
+                "fsppo_joint_aux_weight_clip must be finite and at least 1"
+            )
 
         # The shared launcher enables TF32 ("high"). Different rollout and
         # minibatch GEMM shapes then change the same actor's means enough to
@@ -147,9 +181,7 @@ class FSPPOJoint(FPO):
         self.action_noise_completed_env_steps = 0
         self.enable_budget = bool(cfg.fsppo_joint_enable_budget)
         self.kl_target = cfg.fsppo_joint_kl_target
-        self.kl_coefficient = (
-            cfg.fsppo_joint_kl_coef if self.enable_budget else 0.0
-        )
+        self.kl_coefficient = cfg.fsppo_joint_kl_coef if self.enable_budget else 0.0
         self.dual_lr = cfg.fsppo_joint_dual_lr
         self.kl_coefficient_max = cfg.fsppo_joint_kl_coef_max
         self.map_samples = cfg.fsppo_joint_map_samples
@@ -157,14 +189,20 @@ class FSPPOJoint(FPO):
         self.max_backtracks = cfg.fsppo_joint_max_backtracks
         self.backtrack_factor = cfg.fsppo_joint_backtrack_factor
         self.aux_loss_coef = cfg.fsppo_joint_aux_loss_coef
+        self.aux_weighting = cfg.fsppo_joint_aux_weighting
+        self.aux_temperature = cfg.fsppo_joint_aux_temperature
+        self.aux_weight_clip = cfg.fsppo_joint_aux_weight_clip
+        self.aux_target = cfg.fsppo_joint_aux_target
+        self.entropy_coef = cfg.fsppo_joint_entropy_coef
         self._sampler_contract = self._current_sampler_contract()
         self._old_actor = copy.deepcopy(self.policy.actor).requires_grad_(False).eval()
 
     def begin_rollout(self, completed_env_steps: int) -> None:
-        """Set the fixed conditional Gaussian scale for the next rollout.
+        """Set the scheduled scale or retain the learned scale for a rollout.
 
         The schedule advances only at a rollout boundary. Each collected batch
-        and its subsequent PPO update therefore use the same Gaussian scale.
+        and its subsequent PPO update use that same fixed Gaussian scale.
+        A learned Gaussian scale instead changes through the PPO update.
         """
         if (
             isinstance(completed_env_steps, bool)
@@ -174,6 +212,11 @@ class FSPPOJoint(FPO):
             raise ValueError("completed_env_steps must be a non-negative integer")
         self._check_sampler_contract()
         self.action_noise_completed_env_steps = completed_env_steps
+        if self.learn_action_std:
+            # The scale is part of the actor and follows PPO gradients, not an
+            # external schedule. Sampling and replay use the same saved actor.
+            self.action_noise_schedule_progress = 0.0
+            return
         if self.sigma_decay_env_steps > 0:
             progress = min(completed_env_steps / self.sigma_decay_env_steps, 1.0)
         else:
@@ -213,6 +256,7 @@ class FSPPOJoint(FPO):
         self.transition.action_latent = latent
         self.transition.action_mean = mean
         self.transition.action_log_prob = log_prob
+        self.transition.action_std = self._action_std().expand_as(mean).clone()
         self.transition.values = self.policy.evaluate(critic_obs)
         # The runner may reuse observation buffers before process_env_step.
         self.transition.observations = obs.clone()
@@ -265,6 +309,7 @@ class FSPPOJoint(FPO):
         # Prove that replay still refers to the behavior actor, not an EMA or
         # a policy changed between collection and update.
         self._validate_replay()
+        aux_weight_metrics = self._prepare_aux_weights()
         totals: dict[str, torch.Tensor] = {}
         accepted = rejected = attempted = 0
         last_step_lr = 0.0
@@ -280,13 +325,7 @@ class FSPPOJoint(FPO):
                 )
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            norm = torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(), self.max_grad_norm
-            )
-            if not torch.isfinite(norm):
-                raise FloatingPointError(
-                    "Non-finite FSPPOJoint gradient before optimizer step"
-                )
+            norm = self._clip_gradients(batch, statistics, batch_index=attempted)
             was_accepted, rejected_count, candidate_lr = self._step_with_budget(probe)
             rejected += rejected_count
             if not was_accepted:
@@ -298,14 +337,20 @@ class FSPPOJoint(FPO):
                 self.max_grad_norm / (norm.detach() + 1e-6)
             ).clamp(max=1.0)
             for name, value in statistics.items():
-                totals[name] = totals.get(name, 0.0) + value.detach()
+                value = value.detach()
+                if name == "log_ratio_min":
+                    totals[name] = torch.minimum(totals.get(name, value), value)
+                elif name == "log_ratio_max":
+                    totals[name] = torch.maximum(totals.get(name, value), value)
+                else:
+                    totals[name] = totals.get(name, 0.0) + value
 
         with torch.no_grad():
             if self.enable_budget:
-                probe_kl = self._probe_l1(probe)
+                probe_kl = self._probe_distance(probe)
                 # New states/noises are drawn AFTER all updates; these diagnostics
                 # are not reused for acceptance or described as a hard guarantee.
-                audit_kl = self._probe_l1(self._make_probe())
+                audit_kl = self._probe_distance(self._make_probe())
                 if not torch.isfinite(audit_kl).all():
                     raise FloatingPointError(
                         "Non-finite FSPPOJoint fresh rollout map audit"
@@ -331,7 +376,13 @@ class FSPPOJoint(FPO):
                 variance.new_zeros(()),
             )
             action_std = self.storage.actions.std(dim=(0, 1), unbiased=False).mean()
-        means = {key: value / max(accepted, 1) for key, value in totals.items()}
+            noise_std = self._action_std().detach()
+        means = {
+            key: value
+            if key in ("log_ratio_min", "log_ratio_max")
+            else value / max(accepted, 1)
+            for key, value in totals.items()
+        }
         metrics = {
             "clip_param": self.clip_param,
             # This k3 diagnostic uses a genuine joint likelihood ratio. It is
@@ -340,8 +391,12 @@ class FSPPOJoint(FPO):
             "clip_fraction": means.get("clip_fraction", 0.0),
             "explained_variance": explained,
             "action_std": action_std,
-            "joint/action_noise_std": self.sigma,
-            "joint/action_noise_variance": self.sigma**2,
+            "joint/action_noise_std": noise_std.mean(),
+            "joint/action_noise_std_min": noise_std.min(),
+            "joint/action_noise_std_max": noise_std.max(),
+            "joint/action_noise_variance": noise_std.square().mean(),
+            "joint/learn_action_noise_std": float(self.learn_action_std),
+            "joint/conditional_entropy": self._conditional_entropy().detach(),
             "joint/action_noise_schedule_progress": self.action_noise_schedule_progress,
             "joint/action_noise_completed_env_steps": (
                 self.action_noise_completed_env_steps
@@ -358,22 +413,40 @@ class FSPPOJoint(FPO):
             ),
             "joint/last_step_learning_rate": last_step_lr,
             "joint/ratio_mean": means.get("ratio_mean", 1.0),
+            "joint/log_ratio_min": means.get("log_ratio_min", 0.0),
+            "joint/log_ratio_max": means.get("log_ratio_max", 0.0),
             "joint/map_kl_train": means.get("map_kl", 0.0),
+            "joint/budget_uses_gaussian_kl": float(self.gaussian_residual_policy),
+            **aux_weight_metrics,
             "mean_grad_norm_before_clip": means.get("mean_grad_norm_before_clip", 0.0),
             "mean_grad_norm_after_clip": means.get("mean_grad_norm_after_clip", 0.0),
         }
         if self.enable_budget:
             for name, samples in (("probe", probe_kl), ("audit", audit_kl)):
                 mean = samples.mean()
-                metrics[f"joint/{name}_kl_mean"] = mean
-                metrics[f"joint/{name}_kl_p95"] = torch.quantile(samples.flatten(), 0.95)
-                metrics[f"joint/{name}_kl_max"] = samples.max()
-                metrics[f"joint/{name}_map_distance"] = (
-                    mean * 2 * self.sigma**2
+                # Preserve legacy names, and expose the actual metric used.
+                kind = (
+                    "conditional_joint_kl"
+                    if self.gaussian_residual_policy
+                    else "legacy_map_l1"
                 )
+                for label, value in (
+                    ("mean", mean),
+                    ("p95", torch.quantile(samples.flatten(), 0.95)),
+                    ("max", samples.max()),
+                ):
+                    metrics[f"joint/{name}_kl_{label}"] = value
+                    metrics[f"joint/{name}_{kind}_{label}"] = value
+                if not self.gaussian_residual_policy:
+                    metrics[f"joint/{name}_map_distance"] = mean
+        if self.gaussian_residual_policy:
+            metrics["joint/conditional_joint_kl_train"] = means.get("map_kl", 0.0)
+        else:
+            metrics["joint/legacy_map_l1_train"] = means.get("map_kl", 0.0)
         for name in ("aux_u_loss", "aux_v_loss", "aux_jvp_norm"):
             if name in means:
                 metrics[f"joint/{name}"] = means[name]
+        metrics.update(self._extra_update_metrics(means))
         self.storage.clear()
         self.update_counter += 1
         self.tot_timesteps += 1
@@ -382,11 +455,103 @@ class FSPPOJoint(FPO):
             "value_loss": means.get("value_loss", 0.0),
             "map_kl_loss": means.get("map_kl_loss", 0.0),
             "pmf_aux_loss": means.get("pmf_aux_loss", 0.0),
+            "conditional_entropy_loss": means.get("conditional_entropy_loss", 0.0),
             "total_loss": means.get("total_loss", 0.0),
         }
         self._metrics_to_cpu(loss_dict, metrics)
         loss_dict["metrics"] = metrics
         return loss_dict
+
+    def _clipped_surrogate(
+        self, log_ratio: torch.Tensor, advantages: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate the exact PPO clipped objective without inactive exponentials.
+
+        Positive advantages cap the ratio from above; negative advantages cap
+        it only from below. Clipping in log space prevents the unused positive
+        branch from overflowing and producing ``0 * inf`` in backward. The
+        negative-advantage branch deliberately retains its unbounded penalty.
+        A zero advantage contributes zero regardless of the likelihood ratio.
+        """
+        clipped_log_ratio = torch.where(
+            advantages > 0,
+            log_ratio.clamp_max(math.log1p(self.clip_param)),
+            torch.where(
+                advantages < 0,
+                log_ratio.clamp_min(math.log1p(-self.clip_param)),
+                torch.zeros_like(log_ratio),
+            ),
+        )
+        return -(clipped_log_ratio.exp() * advantages).mean()
+
+    @torch.no_grad()
+    def _clip_gradients(
+        self,
+        batch: dict[str, torch.Tensor],
+        statistics: dict[str, torch.Tensor],
+        *,
+        batch_index: int = 0,
+    ) -> torch.Tensor:
+        """Clip finite gradients, recovering an overflowed FP32 norm in FP64.
+
+        Measure the norm before any in-place scaling: the standard clipping
+        helper would otherwise turn finite gradients into zeros when its norm
+        overflows. Real non-finite gradient entries remain a hard error and
+        are reported with the offending parameters and minibatch ranges.
+        """
+        parameters = [p for p in self.policy.parameters() if p.grad is not None]
+        gradients = [p.grad for p in parameters]
+        norm = torch.nn.utils.get_total_norm(gradients)
+        if not torch.isfinite(norm):
+            bad_parameters = [
+                name
+                for name, parameter in self.policy.named_parameters()
+                if parameter.grad is not None
+                and not torch.isfinite(parameter.grad).all()
+            ]
+            if bad_parameters:
+                raise FloatingPointError(
+                    "Non-finite FSPPOJoint gradient before optimizer step; "
+                    f"iteration={self.update_counter}, minibatch={batch_index}; "
+                    f"parameters={', '.join(bad_parameters)}; "
+                    + self._gradient_failure_ranges(batch, statistics)
+                )
+            norm = torch.nn.utils.get_total_norm(
+                [gradient.to(dtype=torch.float64) for gradient in gradients]
+            )
+            if not torch.isfinite(norm):
+                raise FloatingPointError(
+                    "Non-finite FSPPOJoint FP64 gradient norm; "
+                    f"iteration={self.update_counter}, minibatch={batch_index}; "
+                    + self._gradient_failure_ranges(batch, statistics)
+                )
+        torch.nn.utils.clip_grads_with_norm_(parameters, self.max_grad_norm, norm)
+        return norm
+
+    @staticmethod
+    def _gradient_failure_ranges(
+        batch: dict[str, torch.Tensor], statistics: dict[str, torch.Tensor]
+    ) -> str:
+        """Summarize an exceptional minibatch without printing entire tensors."""
+        ranges = []
+        for name in ("obs", "actions", "returns"):
+            tensor = batch[name].detach()
+            finite = torch.isfinite(tensor)
+            finite_values = tensor[finite]
+            bounds = (
+                f"[{float(finite_values.min()):.6g}, {float(finite_values.max()):.6g}]"
+                if finite_values.numel()
+                else "[no finite values]"
+            )
+            ranges.append(f"{name}={bounds}, nonfinite={int((~finite).sum())}")
+        for name in ("log_ratio_min", "log_ratio_max"):
+            if name in statistics:
+                ranges.append(f"{name}={float(statistics[name].detach()):.6g}")
+        return "; ".join(ranges)
+
+    def _extra_update_metrics(self, means: dict[str, torch.Tensor]) -> dict:
+        """Return variant-specific diagnostics before conversion to CPU scalars."""
+        return {}
 
     def _current_sampler_contract(self) -> dict:
         contract = {
@@ -402,8 +567,17 @@ class FSPPOJoint(FPO):
         }
         if self.sigma_decay_env_steps > 0:
             contract["action_perturb_std_final"] = self.final_sigma
-            contract["action_perturb_std_decay_env_steps"] = (
-                self.sigma_decay_env_steps
+            contract["action_perturb_std_decay_env_steps"] = self.sigma_decay_env_steps
+        if self.gaussian_residual_policy:
+            contract.update(
+                policy_class=type(self.policy).__name__,
+                learn_action_perturb_std=self.learn_action_std,
+                action_perturb_std_min=float(self.policy.action_perturb_std_min),
+                action_perturb_std_max=float(self.policy.action_perturb_std_max),
+                gaussian_residual_scale=float(self.policy.gaussian_residual_scale),
+                actor_residual_scale=float(self.policy.actor.residual_scale),
+                actor_public_output_scale=float(self.policy.actor.public_output_scale),
+                budget_metric="conditional_gaussian_kl",
             )
         return contract
 
@@ -412,10 +586,65 @@ class FSPPOJoint(FPO):
             raise ValueError(
                 "FSPPOJoint sampler dimensions and noise schedule must remain fixed"
             )
-        if float(self.policy.action_perturb_std) != self.sigma:
+        if (
+            not self.learn_action_std
+            and float(self.policy.action_perturb_std) != self.sigma
+        ):
             raise ValueError(
                 "FSPPOJoint action noise may only change at a rollout boundary"
             )
+
+    def _action_std(self, actor: torch.nn.Module | None = None) -> torch.Tensor:
+        """Read the current or frozen conditional scale in action coordinates."""
+        if self.gaussian_residual_policy:
+            return self.policy.conditional_action_std(actor=actor)
+        return next(self.policy.parameters()).new_full(
+            (self.policy.num_actions,), self.sigma
+        )
+
+    def _conditional_entropy(self) -> torch.Tensor:
+        """Gaussian conditional entropy; this excludes latent-action mutual information."""
+        return (self._action_std().log() + 0.5 * math.log(2 * math.pi * math.e)).sum()
+
+    @torch.no_grad()
+    def _prepare_aux_weights(self) -> dict[str, torch.Tensor]:
+        """Freeze capped positive distillation weights for the entire PPO update.
+
+        Standardization and normalization use the complete rollout. These
+        weights are reused unchanged by all epochs and mini-batches. Capping
+        after mean normalization can reduce their final mean below one.
+        """
+        weights = self.storage.aux_weights
+        weights.fill_(1.0)
+        if self.aux_loss_coef > 0 and self.aux_weighting == "advantage_exp":
+            advantages = self.storage.advantages.detach()
+            standardized = (advantages - advantages.mean()) / (
+                advantages.std(unbiased=False) + 1e-8
+            )
+            log_weights = standardized / self.aux_temperature
+            if not torch.isfinite(log_weights).all():
+                raise FloatingPointError("Non-finite FSPPOJoint auxiliary log weights")
+            log_weights = (log_weights - log_weights.max()).clamp_min(
+                math.log(torch.finfo(log_weights.dtype).tiny)
+            )
+            positive_weights = log_weights.exp()
+            positive_weights = positive_weights / positive_weights.mean()
+            weights.copy_(positive_weights.clamp_max(self.aux_weight_clip))
+        flat = weights.flatten()
+        # Fraction of an equivalent uniformly weighted rollout, in (0, 1].
+        ess_fraction = flat.sum().square() / (flat.square().sum() * flat.numel())
+        return {
+            "joint/aux_weight_mean": flat.mean(),
+            "joint/aux_weight_min": flat.min(),
+            "joint/aux_weight_max": flat.max(),
+            "joint/aux_weight_ess_fraction": ess_fraction,
+            "joint/aux_reward_weighting": flat.new_tensor(
+                float(self.aux_weighting == "advantage_exp")
+            ),
+            "joint/aux_target_is_mean": flat.new_tensor(
+                float(self.aux_target == "means")
+            ),
+        }
 
     @torch.no_grad()
     def _validate_replay(self) -> None:
@@ -424,10 +653,27 @@ class FSPPOJoint(FPO):
         means = self.storage.action_means.flatten(0, 1)
         actions = self.storage.actions.flatten(0, 1)
         log_probs = self.storage.action_log_probs.flatten(0, 1)
+        action_stds = self.storage.action_stds.flatten(0, 1)
         for start in range(0, obs.shape[0], self.probe_size):
             part = slice(start, start + self.probe_size)
             replay = self.policy.transport_actions(obs[part], latents[part])
-            log_prob = self.policy.conditional_action_log_prob(actions[part], replay)
+            if self.gaussian_residual_policy:
+                if not torch.allclose(
+                    self._action_std().expand_as(action_stds[part]),
+                    action_stds[part],
+                    rtol=1e-5,
+                    atol=1e-7,
+                ):
+                    raise RuntimeError(
+                        "FSPPOJoint behavior replay mismatch: action scale changed"
+                    )
+                log_prob = self.policy.conditional_action_log_prob(
+                    actions[part], replay, std=action_stds[part]
+                )
+            else:
+                log_prob = self.policy.conditional_action_log_prob(
+                    actions[part], replay
+                )
             if not torch.allclose(
                 replay, means[part], rtol=1e-4, atol=1e-6
             ) or not torch.allclose(log_prob, log_probs[part], rtol=1e-4, atol=1e-4):
@@ -447,18 +693,57 @@ class FSPPOJoint(FPO):
             ]
             obs = observations[indices]
             noise = torch.randn(
-                obs.shape[0], self.map_samples, self.policy.num_actions, device=self.device
+                obs.shape[0],
+                self.map_samples,
+                self.policy.num_actions,
+                device=self.device,
             )
-            old_actions = self.policy.transport_actions(obs, noise, actor=self._old_actor)
-            return {"obs": obs, "noise": noise, "old_actions": old_actions}
+            old_actions = self.policy.transport_actions(
+                obs, noise, actor=self._old_actor
+            )
+            return {
+                "obs": obs,
+                "noise": noise,
+                "old_actions": old_actions,
+                "old_std": self._action_std(actor=self._old_actor).clone(),
+            }
         else:
-            return {"obs": torch.empty(0), "noise": torch.empty(0), "old_actions": torch.empty(0)}
+            return {
+                "obs": torch.empty(0),
+                "noise": torch.empty(0),
+                "old_actions": torch.empty(0),
+            }
 
     @torch.no_grad()
     def _probe_l1(self, probe: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Wasserstein distance between current and old transport actions."""
-        actions: torch.Tensor = self.policy.transport_actions(probe["obs"], probe["noise"])
-        return ((actions - probe["old_actions"])).absolute().sum(dim=-1)
+        """Legacy L1 same-latent map cost; it is not a Gaussian KL."""
+        actions: torch.Tensor = self.policy.transport_actions(
+            probe["obs"], probe["noise"]
+        )
+        return (actions - probe["old_actions"]).absolute().sum(dim=-1)
+
+    def _gaussian_kl(
+        self,
+        current_mean: torch.Tensor,
+        old_mean: torch.Tensor,
+        old_std: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute ``KL(old || current)`` including learned scale changes."""
+        current_std = self._action_std()
+        log_variance_ratio = 2 * (old_std / current_std).log()
+        # expm1 avoids losing a small variance-only KL by subtracting 0.5
+        # from another number near 0.5 in single precision.
+        variance_kl = 0.5 * (torch.expm1(log_variance_ratio) - log_variance_ratio)
+        mean_kl = 0.5 * ((old_mean - current_mean) / current_std).square()
+        return (variance_kl + mean_kl).sum(dim=-1)
+
+    @torch.no_grad()
+    def _probe_distance(self, probe: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Evaluate the selected policy's budget metric on a fixed probe."""
+        if not self.gaussian_residual_policy:
+            return self._probe_l1(probe)
+        current_mean = self.policy.transport_actions(probe["obs"], probe["noise"])
+        return self._gaussian_kl(current_mean, probe["old_actions"], probe["old_std"])
 
     def _batch_loss(
         self, batch: dict[str, torch.Tensor]
@@ -474,13 +759,11 @@ class FSPPOJoint(FPO):
         mean = self.policy.transport_actions(obs, batch["action_latents"])
         log_prob = self.policy.conditional_action_log_prob(actions, mean)
         log_ratio = log_prob - batch["action_log_probs"]
-        # No CFM-score or straight-through log-ratio clamp: this is the actual
-        # joint ratio. Non-finite updates fail before mutating the optimizer.
-        ratio = log_ratio.exp()
-        surrogate = -torch.minimum(
-            ratio * advantages,
-            ratio.clamp(1 - self.clip_param, 1 + self.clip_param) * advantages,
-        ).mean()
+        surrogate = self._clipped_surrogate(log_ratio, advantages)
+        # Preserve the actual joint ratio for diagnostics; it is not an
+        # autograd branch of the clipped surrogate.
+        detached_log_ratio = log_ratio.detach()
+        ratio = detached_log_ratio.exp()
         value = self.policy.evaluate(batch["critic_obs"])
         value_error = (value - batch["returns"]).square()
         if self.use_clipped_value_loss:
@@ -491,28 +774,61 @@ class FSPPOJoint(FPO):
                 value_error, (clipped - batch["returns"]).square()
             )
         value_loss = value_error.mean()
-        noise = torch.randn(
-            obs.shape[0], self.map_samples, self.policy.num_actions, device=self.device
+        if self.gaussian_residual_policy and not self.enable_budget:
+            # Saved behavior latents already give an empirical joint KL. Avoid
+            # additional transport evaluations when this is diagnostic only.
+            map_kl = self._gaussian_kl(
+                mean, batch["action_means"], batch["action_stds"]
+            ).mean()
+        else:
+            noise = torch.randn(
+                obs.shape[0],
+                self.map_samples,
+                self.policy.num_actions,
+                device=self.device,
+            )
+            current_map = self.policy.transport_actions(obs, noise)
+            with torch.no_grad():
+                old_map = self.policy.transport_actions(
+                    obs, noise, actor=self._old_actor
+                )
+            if self.gaussian_residual_policy:
+                map_kl = self._gaussian_kl(
+                    current_map, old_map, self._action_std(actor=self._old_actor)
+                ).mean()
+            else:
+                map_kl = (current_map - old_map).absolute().sum(dim=-1).mean()
+        aux_target = batch["action_means"] if self.aux_target == "means" else actions
+        aux_loss, aux_metrics = self._auxiliary_loss(
+            obs, aux_target.detach(), batch.get("aux_weights")
         )
-        current_map = self.policy.transport_actions(obs, noise)
-        with torch.no_grad():
-            old_map = self.policy.transport_actions(obs, noise, actor=self._old_actor)
-        map_kl = (current_map - old_map).absolute().sum(dim=-1).mean()
-        aux_loss, aux_metrics = self._auxiliary_loss(obs, actions)
         penalty = (
-            self.kl_coefficient * map_kl
-            if self.enable_budget
-            else map_kl.new_zeros(())
+            self.kl_coefficient * map_kl if self.enable_budget else map_kl.new_zeros(())
         )
-        weighted_aux = torch.mean(self.aux_loss_coef * aux_loss * advantages)
-        loss = surrogate + self.value_loss_coef * value_loss + penalty + weighted_aux
+        # pMF regression uses non-negative weights; signed advantages would
+        # reward increasing the residual on negative-advantage samples.
+        weighted_aux = self.aux_loss_coef * aux_loss.mean()
+        # This is H(a | obs, latent), not the marginal mixture/action entropy.
+        entropy_loss = -self.entropy_coef * self._conditional_entropy()
+        loss = (
+            surrogate
+            + self.value_loss_coef * value_loss
+            + penalty
+            + weighted_aux
+            + entropy_loss
+        )
         statistics = {
             "surrogate_loss": surrogate,
             "value_loss": value_loss,
             "map_kl_loss": penalty,
             "pmf_aux_loss": weighted_aux,
+            "conditional_entropy_loss": entropy_loss,
             "total_loss": loss,
-            "sample_joint_kl": (torch.expm1(log_ratio) - log_ratio).mean(),
+            "sample_joint_kl": (
+                torch.expm1(detached_log_ratio) - detached_log_ratio
+            ).mean(),
+            "log_ratio_min": detached_log_ratio.min(),
+            "log_ratio_max": detached_log_ratio.max(),
             "clip_fraction": ((ratio - 1).abs() > self.clip_param).float().mean(),
             "ratio_mean": ratio.mean(),
             "map_kl": map_kl,
@@ -521,8 +837,17 @@ class FSPPOJoint(FPO):
         return loss, statistics
 
     def _auxiliary_loss(
-        self, obs: torch.Tensor, actions: torch.Tensor
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
+        """Regress pMF on frozen behavior targets with non-negative weights.
+
+        Mean targets distill the transport before conditional action noise is
+        added. Advantage weights make this reward-aware transport distillation;
+        they do not implement an exact state-wise marginal Gibbs projection.
+        """
         if self.aux_loss_coef == 0:
             return obs.new_zeros(()), {}
         shape = (obs.shape[0], self.n_samples_per_action, 1)
@@ -542,9 +867,12 @@ class FSPPOJoint(FPO):
         score, _, _, components = self.policy.get_pmf_loss(
             obs, actions, eps, r, t, return_components=True
         )
-        return score, {
-            "aux_u_loss": components["u_loss"].mean(),
-            "aux_v_loss": components["v_loss"].mean(),
+        if weights is None:
+            weights = score.new_ones((obs.shape[0], 1))
+        weights = weights.detach()
+        return score * weights, {
+            "aux_u_loss": (components["u_loss"] * weights).mean(),
+            "aux_v_loss": (components["v_loss"] * weights).mean(),
             "aux_jvp_norm": components["jvp_norm"].mean(),
         }
 
@@ -568,7 +896,7 @@ class FSPPOJoint(FPO):
             for group, lr in zip(self.optimizer.param_groups, base_lrs):
                 group["lr"] = lr * factor
             self.optimizer.step()
-            kl = self._probe_l1(probe)
+            kl = self._probe_distance(probe)
             finite_parameters = bool(
                 torch.stack(
                     [torch.isfinite(p).all() for p in self.policy.parameters()]

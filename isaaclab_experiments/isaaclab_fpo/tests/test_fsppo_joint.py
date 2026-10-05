@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +15,7 @@ pytest.importorskip("isaaclab")
 
 from isaaclab_fpo.algorithms import FSPPOJoint
 from isaaclab_fpo.cli_args import update_fpo_cfg
-from isaaclab_fpo.modules import PMFActorCritic
+from isaaclab_fpo.modules import GaussianResidualPMFActorCritic, PMFActorCritic
 from isaaclab_fpo.rl_cfg import (
     FpoRslRlOnPolicyRunnerCfg,
     FpoRslRlPpoActorCriticCfg,
@@ -66,9 +68,10 @@ def make_algorithm_cfg(**overrides):
     return FpoRslRlPpoAlgorithmCfg(**settings)
 
 
-def make_algorithm(**overrides):
+def make_algorithm(policy_class=PMFActorCritic, policy_overrides=None, **overrides):
     return FSPPOJoint(
-        PMFActorCritic(3, 3, 2, make_policy_cfg()), make_algorithm_cfg(**overrides)
+        policy_class(3, 3, 2, make_policy_cfg(**(policy_overrides or {}))),
+        make_algorithm_cfg(**overrides),
     )
 
 
@@ -96,6 +99,135 @@ def assert_tree_equal(left, right):
             assert_tree_equal(a, b)
     else:
         assert left == right
+
+
+@pytest.mark.parametrize("learn_std", [False, True])
+def test_gaussian_residual_starts_as_latent_independent_gaussian(learn_std):
+    policy = GaussianResidualPMFActorCritic(
+        3,
+        3,
+        2,
+        make_policy_cfg(
+            learn_action_perturb_std=learn_std,
+            actor_mlp_output_scale=0.7,
+            actor_scale=0.5,
+        ),
+    )
+    observations = torch.randn(4, 3)
+    latent = torch.randn(4, 2)
+    expected_mean = policy.actor.mean(observations)
+    assert torch.allclose(policy.transport_actions(observations, latent), expected_mean)
+    assert torch.allclose(
+        policy.transport_actions(observations, -10 * latent), expected_mean
+    )
+    multiple_means = policy.transport_actions(observations, torch.randn(4, 3, 2))
+    assert torch.allclose(
+        multiple_means, expected_mean[:, None, :].expand_as(multiple_means)
+    )
+
+    actions, _, means, log_prob = policy.sample_transport(observations)
+    oracle = (
+        torch.distributions.Normal(expected_mean, 0.2)
+        .log_prob(actions)
+        .sum(-1, keepdim=True)
+    )
+    assert torch.allclose(means, expected_mean)
+    assert torch.allclose(log_prob, oracle, atol=1e-6)
+
+    density_loss = -policy.conditional_action_log_prob(actions.detach(), means).mean()
+    # A subsequent KL/entropy query must not mutate the scale saved for this
+    # density's backward. Fixed sigma previously reused an in-place buffer.
+    policy.conditional_action_std()
+    policy.conditional_action_log_prob(actions.detach(), means)
+    density_loss.backward()
+    actor_gradients = [
+        parameter.grad
+        for parameter in policy.actor.parameters()
+        if parameter.grad is not None
+    ]
+    assert actor_gradients
+    assert all(torch.isfinite(gradient).all() for gradient in actor_gradients)
+    assert any(torch.count_nonzero(gradient) for gradient in actor_gradients)
+
+
+def test_learned_action_std_receives_density_gradient_and_respects_bounds():
+    policy = GaussianResidualPMFActorCritic(
+        3,
+        3,
+        2,
+        make_policy_cfg(
+            learn_action_perturb_std=True,
+            action_perturb_std_min=0.05,
+            action_perturb_std_max=0.8,
+        ),
+    )
+    before = policy.conditional_action_std().detach().clone()
+    means = policy.transport_actions(torch.zeros(3, 3), torch.zeros(3, 2))
+    optimizer = torch.optim.SGD(policy.parameters(), lr=0.1)
+    optimizer.zero_grad()
+    (-policy.conditional_action_log_prob(means.detach(), means).mean()).backward()
+    assert torch.count_nonzero(policy.actor.action_std_logit.grad) == 2
+    optimizer.step()
+    assert bool((policy.conditional_action_std() < before).all())
+
+    with torch.no_grad():
+        policy.actor.action_std_logit.copy_(torch.tensor([-100.0, 100.0]))
+    extreme_std = policy.conditional_action_std()
+    assert torch.allclose(extreme_std, torch.tensor([0.05, 0.8]))
+    assert bool(torch.isfinite(extreme_std).all())
+    assert torch.isfinite(
+        policy.conditional_action_log_prob(means.detach(), means)
+    ).all()
+
+
+def test_learned_action_std_rejects_a_hand_scheduled_noise_override():
+    with pytest.raises(ValueError, match="Learned action noise requires"):
+        make_algorithm(
+            policy_class=GaussianResidualPMFActorCritic,
+            policy_overrides={"learn_action_perturb_std": True},
+            action_perturb_std_final=0.1,
+            action_perturb_std_decay_env_steps=100,
+        )
+
+
+def test_joint_ratio_keeps_behavior_std_when_only_current_std_changes():
+    alg = make_algorithm(
+        policy_class=GaussianResidualPMFActorCritic,
+        policy_overrides={"learn_action_perturb_std": True},
+        fsppo_joint_enable_budget=False,
+    )
+    collect(alg)
+    batch = next(alg.storage.mini_batch_generator(1, 1))
+    old_std = batch["action_stds"].clone()
+    old_logp = batch["action_log_probs"].clone()
+    with torch.no_grad():
+        alg.policy.actor.action_std_logit.add_(torch.tensor([0.3, -0.2]))
+    new_mean = alg.policy.transport_actions(batch["obs"], batch["action_latents"])
+    new_std = alg.policy.conditional_action_std()
+    oracle_old = torch.distributions.Normal(batch["action_means"], old_std)
+    oracle_new = torch.distributions.Normal(new_mean, new_std)
+    expected_log_ratio = (
+        oracle_new.log_prob(batch["actions"]) - oracle_old.log_prob(batch["actions"])
+    ).sum(-1, keepdim=True)
+    actual_log_ratio = (
+        alg.policy.conditional_action_log_prob(batch["actions"], new_mean) - old_logp
+    )
+    assert torch.allclose(actual_log_ratio, expected_log_ratio, atol=1e-6)
+    assert not torch.allclose(actual_log_ratio, torch.zeros_like(actual_log_ratio))
+    assert torch.equal(batch["action_stds"], old_std)
+    assert torch.allclose(
+        alg.policy.conditional_action_log_prob(
+            batch["actions"], batch["action_means"], std=old_std
+        ),
+        old_logp,
+        atol=1e-6,
+    )
+    _, metrics = alg._batch_loss(batch)
+    assert torch.allclose(metrics["ratio_mean"], expected_log_ratio.exp().mean())
+    expected_kl = (
+        torch.distributions.kl_divergence(oracle_old, oracle_new).sum(-1).mean()
+    )
+    assert torch.allclose(metrics["map_kl"], expected_kl, atol=1e-6)
 
 
 def test_joint_ratio_equals_gaussian_density_ratio_and_replays_actual_latent():
@@ -173,17 +305,291 @@ def test_no_budget_mode_applies_all_steps_at_configured_learning_rate():
     assert results["metrics"]["joint/kl_coefficient_next"] == 0.0
 
 
+def test_ppo_surrogate_matches_float64_oracle_including_saturated_ratios():
+    # A positive advantage at log-ratio 100 has a finite, constant PPO
+    # objective. Evaluating the unused exp branch in FP32 used to poison its
+    # backward with 0 * inf; a zero advantage must also have zero gradient.
+    log_ratios = torch.tensor(
+        [
+            -100.0,
+            -1.0,
+            -0.3,
+            0.0,
+            0.1,
+            0.4,
+            100.0,
+            -100.0,
+            -1.0,
+            -0.3,
+            0.0,
+            0.1,
+            0.4,
+            2.0,
+            100.0,
+            -100.0,
+        ]
+    )[:, None]
+    advantages = torch.tensor(
+        [
+            1.0,
+            2.0,
+            1.0,
+            2.0,
+            1.0,
+            2.0,
+            1.0,
+            -1.0,
+            -2.0,
+            -1.0,
+            -2.0,
+            -1.0,
+            -2.0,
+            -1.0,
+            0.0,
+            0.0,
+        ]
+    )[:, None]
+    alg = make_algorithm(
+        policy_class=GaussianResidualPMFActorCritic,
+        policy_overrides={"learn_action_perturb_std": True},
+        fsppo_joint_enable_budget=False,
+        value_loss_coef=0.0,
+    )
+    collect(alg, steps=1, num_envs=len(log_ratios))
+    batch = next(alg.storage.mini_batch_generator(1, 1))
+    means = alg.policy.transport_actions(batch["obs"], batch["action_latents"])
+    current_log_prob = alg.policy.conditional_action_log_prob(batch["actions"], means)
+    batch["advantages"] = advantages
+    batch["action_log_probs"] = (
+        current_log_prob.detach() - log_ratios
+    ).requires_grad_()
+
+    saturated_batch = {key: value[6:7] for key, value in batch.items()}
+    saturated_loss, _ = alg._batch_loss(saturated_batch)
+    assert torch.isfinite(saturated_loss)
+    assert float(saturated_loss.detach()) == pytest.approx(-(1 + alg.clip_param))
+    saturated_loss.backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in alg.policy.parameters()
+        if parameter.grad is not None
+    )
+    alg.optimizer.zero_grad(set_to_none=True)
+
+    # The conventional PPO expression is a safe independent oracle in FP64
+    # over this entire range, including exp(100).
+    oracle_log_ratios = log_ratios.double().requires_grad_()
+    oracle_ratios = oracle_log_ratios.exp()
+    oracle = -torch.minimum(
+        oracle_ratios * advantages.double(),
+        oracle_ratios.clamp(1 - alg.clip_param, 1 + alg.clip_param)
+        * advantages.double(),
+    ).mean()
+    oracle_gradient = torch.autograd.grad(oracle, oracle_log_ratios)[0]
+
+    loss, metrics = alg._batch_loss(batch)
+    actual_gradient = -torch.autograd.grad(
+        metrics["surrogate_loss"], batch["action_log_probs"], retain_graph=True
+    )[0]
+    assert torch.isfinite(loss)
+    assert torch.allclose(loss.double(), oracle.detach(), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(
+        actual_gradient.double(), oracle_gradient, atol=1e-7, rtol=1e-5
+    )
+    assert torch.equal(actual_gradient[[6, 14, 15]], torch.zeros(3, 1))
+    loss.backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in alg.policy.parameters()
+        if parameter.grad is not None
+    )
+
+
+def test_finite_large_gradient_is_clipped_before_optimizer_commit():
+    alg = make_algorithm(
+        policy_class=GaussianResidualPMFActorCritic,
+        policy_overrides={"learn_action_perturb_std": True},
+        fsppo_joint_enable_budget=False,
+        num_learning_epochs=1,
+        num_mini_batches=1,
+    )
+    # SGD makes the committed update an independent, explicit clipping oracle.
+    alg.optimizer = torch.optim.SGD(alg.policy.parameters(), lr=0.05)
+    collect(alg)
+    parameter = alg.policy.actor.mean[-1].bias
+    before = parameter.detach().clone()
+    injected_gradient = torch.tensor([3e20, 4e20])
+    assert torch.isfinite(injected_gradient).all()
+    assert not torch.isfinite(torch.linalg.vector_norm(injected_gradient))
+    expected_norm = torch.linalg.vector_norm(injected_gradient.double())
+    expected_gradient = (
+        injected_gradient.double() * (alg.max_grad_norm / expected_norm)
+    ).float()
+    handle = parameter.register_hook(lambda grad: injected_gradient.to(grad))
+    try:
+        result = alg.update()
+    finally:
+        handle.remove()
+
+    assert torch.allclose(parameter, before - 0.05 * expected_gradient, atol=1e-7)
+    assert result["metrics"]["joint/accepted_updates"] == 1
+    assert result["metrics"]["mean_grad_norm_before_clip"] == pytest.approx(
+        float(expected_norm), rel=1e-6
+    )
+    assert result["metrics"]["mean_grad_norm_after_clip"] == pytest.approx(
+        alg.max_grad_norm, rel=1e-6
+    )
+
+
+def test_nonfinite_gradient_identifies_parameter_without_optimizer_commit():
+    alg = make_algorithm(
+        policy_class=GaussianResidualPMFActorCritic,
+        policy_overrides={"learn_action_perturb_std": True},
+        fsppo_joint_enable_budget=False,
+        num_learning_epochs=1,
+        num_mini_batches=1,
+    )
+    collect(alg)
+    alg.update()  # The failure must preserve existing Adam momentum too.
+    assert alg.optimizer.state
+    collect(alg)
+    parameter = alg.policy.actor.mean[-1].bias
+    parameter_name = next(
+        name
+        for name, candidate in alg.policy.named_parameters()
+        if candidate is parameter
+    )
+    model_before = copy.deepcopy(alg.policy.state_dict())
+    optimizer_before = copy.deepcopy(alg.optimizer.state_dict())
+
+    def nonfinite_gradient(gradient):
+        gradient = gradient.clone()
+        gradient[0] = float("nan")
+        return gradient
+
+    handle = parameter.register_hook(nonfinite_gradient)
+    try:
+        with pytest.raises(FloatingPointError, match=re.escape(parameter_name)):
+            alg.update()
+    finally:
+        handle.remove()
+    assert_tree_equal(alg.policy.state_dict(), model_before)
+    assert_tree_equal(alg.optimizer.state_dict(), optimizer_before)
+
+
 def test_auxiliary_regression_is_separate_positive_loss():
     alg = make_algorithm(fsppo_joint_aux_loss_coef=0.1)
     collect(alg)
+    # Negative policy advantages must not turn regression into maximization.
+    alg.storage.advantages.fill_(-1.0)
     results = alg.update()
     assert results["pmf_aux_loss"] > 0
     assert results["metrics"]["joint/aux_v_loss"] > 0
     assert torch.isfinite(torch.tensor(results["total_loss"]))
 
 
-def test_rejected_candidate_restores_model_and_adam_state_even_after_previous_updates():
-    alg = make_algorithm(fsppo_joint_max_backtracks=1)
+@pytest.mark.parametrize("weight_clip", [20.0, 1.25])
+def test_advantage_distillation_weights_are_global_capped_and_frozen(
+    monkeypatch, weight_clip
+):
+    alg = make_algorithm(
+        policy_class=GaussianResidualPMFActorCritic,
+        policy_overrides={"learn_action_perturb_std": True},
+        fsppo_joint_enable_budget=False,
+        fsppo_joint_aux_loss_coef=0.1,
+        fsppo_joint_aux_weighting="advantage_exp",
+        fsppo_joint_aux_temperature=math.sqrt(1.5) / math.log(2),
+        fsppo_joint_aux_weight_clip=weight_clip,
+        fsppo_joint_aux_target="means",
+    )
+    with torch.no_grad():
+        for parameter in alg.policy.critic.parameters():
+            parameter.zero_()
+    alg.init_storage(3, 1, [3], [3], [2])
+    observations = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+    alg.act(observations, observations)
+    alg.process_env_step(
+        torch.tensor([-1.0, 0.0, 1.0]), torch.ones(3, dtype=torch.bool), {}
+    )
+    alg.compute_returns(observations)
+    # Zero values and terminal transitions give A=[-1,0,1]. At this temperature,
+    # exponentiated standardized advantages are proportional to [1/2,1,2].
+    expected = torch.tensor([3 / 7, 6 / 7, min(12 / 7, weight_clip)])
+    original_generator = alg.storage.mini_batch_generator
+    seen_ids = []
+
+    def record_batches(*args, **kwargs):
+        for batch in original_generator(*args, **kwargs):
+            ids = batch["obs"][:, 0].long()
+            assert torch.allclose(batch["aux_weights"][:, 0], expected[ids])
+            assert not batch["aux_weights"].requires_grad
+            seen_ids.append(ids)
+            yield batch
+
+    monkeypatch.setattr(alg.storage, "mini_batch_generator", record_batches)
+    result = alg.update()
+    assert len(seen_ids) == 4
+    assert torch.equal(
+        torch.cat(seen_ids).sort().values, torch.tensor([0, 0, 1, 1, 2, 2])
+    )
+    assert torch.allclose(alg.storage.aux_weights[0, :, 0], expected)
+    assert result["metrics"]["joint/aux_weight_mean"] == pytest.approx(
+        float(expected.mean())
+    )
+    assert result["pmf_aux_loss"] >= 0
+
+
+@pytest.mark.parametrize("target", ["means", "actions"])
+def test_distillation_target_selection_separates_transport_from_conditional_noise(
+    target,
+):
+    alg = make_algorithm(
+        policy_class=GaussianResidualPMFActorCritic,
+        policy_overrides={"learn_action_perturb_std": True},
+        fsppo_joint_enable_budget=False,
+        fsppo_joint_aux_loss_coef=0.1,
+        fsppo_joint_aux_target=target,
+    )
+    collect(alg)
+    batch = next(alg.storage.mini_batch_generator(1, 1))
+
+    batch["actions"] = batch["actions"].detach().requires_grad_()
+    batch["action_means"] = batch["action_means"].detach().requires_grad_()
+    batch["aux_weights"] = batch["aux_weights"].detach().requires_grad_()
+
+    def auxiliary_value(candidate):
+        # Reuse the same random regression times/noise to isolate the target.
+        torch.manual_seed(123)
+        return alg._batch_loss(candidate)[1]["pmf_aux_loss"]
+
+    initial = auxiliary_value(batch)
+    changed_actions = {**batch, "actions": batch["actions"] + 2}
+    changed_means = {**batch, "action_means": batch["action_means"] + 2}
+    if target == "means":
+        assert torch.equal(auxiliary_value(changed_actions), initial)
+        assert not torch.allclose(auxiliary_value(changed_means), initial)
+    else:
+        assert torch.equal(auxiliary_value(changed_means), initial)
+        assert not torch.allclose(auxiliary_value(changed_actions), initial)
+    initial.backward()
+    assert batch["actions"].grad is None
+    assert batch["action_means"].grad is None
+    assert batch["aux_weights"].grad is None
+
+
+@pytest.mark.parametrize(
+    "policy_class", [PMFActorCritic, GaussianResidualPMFActorCritic]
+)
+def test_rejected_candidate_restores_model_and_adam_state_even_after_previous_updates(
+    policy_class,
+):
+    alg = make_algorithm(
+        policy_class=policy_class,
+        policy_overrides={
+            "learn_action_perturb_std": policy_class is GaussianResidualPMFActorCritic
+        },
+        fsppo_joint_max_backtracks=1,
+    )
     collect(alg)
     alg.update()  # Populate optimizer momentum before testing rollback.
     collect(alg)
@@ -191,7 +597,11 @@ def test_rejected_candidate_restores_model_and_adam_state_even_after_previous_up
     probe = alg._make_probe()
     alg.optimizer.zero_grad(set_to_none=True)
     # A known nonzero action-output gradient must violate an effectively zero budget.
-    alg.policy.actor[-1].bias[:2].sum().backward()
+    if policy_class is GaussianResidualPMFActorCritic:
+        # A variance-only change must also consume the full Gaussian KL budget.
+        alg.policy.actor.action_std_logit.sum().backward()
+    else:
+        alg.policy.actor[-1].bias[:2].sum().backward()
     model_before = copy.deepcopy(alg.policy.state_dict())
     optimizer_before = copy.deepcopy(alg.optimizer.state_dict())
     alg.kl_target = 1e-30
@@ -286,7 +696,7 @@ def test_state_restores_dual_counter_and_checks_sampling_contract():
     with pytest.raises(ValueError, match="sampling contract"):
         other.load_state_dict(changed)
     other.policy.action_perturb_std *= 2
-    with pytest.raises(ValueError, match="fixed"):
+    with pytest.raises(ValueError, match="rollout boundary"):
         other.act(torch.randn(2, 3), torch.randn(2, 3))
 
 
@@ -315,6 +725,10 @@ def test_joint_policy_requires_consistent_full_precision_across_batch_shapes():
         {"trust_region_mode": "aspo"},
         {"schedule": "adaptive"},
         {"storage_action_noise_std": 0.1},
+        {"fsppo_joint_aux_weighting": "signed"},
+        {"fsppo_joint_aux_target": "latent"},
+        {"fsppo_joint_aux_temperature": 0},
+        {"fsppo_joint_aux_weight_clip": 0.5},
     ],
 )
 def test_invalid_algorithm_contracts_fail_early(overrides):
@@ -355,10 +769,21 @@ class FakeEnv:
         return obs, {"observations": {"critic": obs}}
 
 
-def make_runner(ema_decay=0.0, action_perturb_std=0.2):
+def make_runner(
+    ema_decay=0.0,
+    action_perturb_std=0.2,
+    policy_overrides=None,
+    algorithm_overrides=None,
+):
     cfg = FpoRslRlOnPolicyRunnerCfg(
-        policy=make_policy_cfg(action_perturb_std=action_perturb_std),
-        algorithm=make_algorithm_cfg(ema_decay=ema_decay, ema_warmup_steps=0),
+        policy=make_policy_cfg(
+            action_perturb_std=action_perturb_std, **(policy_overrides or {})
+        ),
+        algorithm=make_algorithm_cfg(
+            ema_decay=ema_decay,
+            ema_warmup_steps=0,
+            **(algorithm_overrides or {}),
+        ),
         num_steps_per_env=3,
         max_iterations=2,
         save_interval=1,
@@ -371,14 +796,22 @@ def make_runner(ema_decay=0.0, action_perturb_std=0.2):
     return runner
 
 
-def test_runner_checkpoint_round_trip_and_cross_algorithm_rejection(tmp_path):
-    runner = make_runner()
+@pytest.mark.parametrize(
+    "policy_name", ["PMFActorCritic", "GaussianResidualPMFActorCritic"]
+)
+def test_runner_checkpoint_round_trip_and_cross_algorithm_rejection(
+    tmp_path, policy_name
+):
+    policy_overrides = {"class_name": policy_name}
+    if policy_name == "GaussianResidualPMFActorCritic":
+        policy_overrides["learn_action_perturb_std"] = True
+    runner = make_runner(policy_overrides=policy_overrides)
     collect(runner.alg)
     runner.alg.update()
     runner.current_learning_iteration = 3
     path = str(tmp_path / "joint.pt")
     runner.save(path)
-    restored = make_runner()
+    restored = make_runner(policy_overrides=policy_overrides)
     restored.load(path)
     assert_tree_equal(restored.alg.policy.state_dict(), runner.alg.policy.state_dict())
     assert_tree_equal(
@@ -387,12 +820,31 @@ def test_runner_checkpoint_round_trip_and_cross_algorithm_rejection(tmp_path):
     assert_tree_equal(restored.alg.state_dict(), runner.alg.state_dict())
     assert restored.current_learning_iteration == 3
     with pytest.raises(ValueError, match="sampling contract"):
-        make_runner(action_perturb_std=0.1).load(path)
+        make_runner(action_perturb_std=0.1, policy_overrides=policy_overrides).load(
+            path
+        )
     saved = torch.load(path, weights_only=False)
     saved["algorithm_class_name"] = "FSPPO"
     torch.save(saved, tmp_path / "old.pt")
     with pytest.raises(ValueError, match="algorithm"):
         restored.load(str(tmp_path / "old.pt"), load_optimizer=False)
+    if policy_name == "GaussianResidualPMFActorCritic":
+        assert not torch.allclose(
+            runner.alg.policy.conditional_action_std(), torch.full((2,), 0.2)
+        )
+        assert torch.count_nonzero(runner.alg.policy.actor.residual[-1].weight[:2]) > 0
+        # Restoring the trainable scale and Adam moments must also reproduce
+        # the next update, rather than only yield matching checkpoint tensors.
+        for algorithm in (runner.alg, restored.alg):
+            torch.manual_seed(321)
+            collect(algorithm)
+            algorithm.update()
+        assert_tree_equal(
+            restored.alg.policy.state_dict(), runner.alg.policy.state_dict()
+        )
+        assert_tree_equal(
+            restored.alg.optimizer.state_dict(), runner.alg.optimizer.state_dict()
+        )
 
 
 def test_resume_uses_online_actor_not_ema_weights(tmp_path):

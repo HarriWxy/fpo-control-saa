@@ -69,26 +69,41 @@ def collect(algorithm):
 
 def record_gradient_norms(monkeypatch):
     """Measure actual gradient tensors independently of reported clip norms."""
-    original_clip = torch.nn.utils.clip_grad_norm_
     observations = []
+    recording = False
 
-    def clip(parameters, max_norm, *args, **kwargs):
-        parameters = list(parameters)
+    def instrument(original_clip):
+        def clip(parameters, *args, **kwargs):
+            nonlocal recording
+            parameters = list(parameters)
+            # Both public APIs can own clipping. Avoid counting twice if a
+            # PyTorch version delegates from one patched API to the other.
+            if recording:
+                return original_clip(parameters, *args, **kwargs)
 
-        def actual_norm():
-            gradients = [
-                p.grad.detach().flatten().double()
-                for p in parameters
-                if p.grad is not None
-            ]
-            return float(torch.cat(gradients).norm())
+            def actual_norm():
+                gradients = [
+                    p.grad.detach().flatten().double()
+                    for p in parameters
+                    if p.grad is not None
+                ]
+                return float(torch.cat(gradients).norm())
 
-        before = actual_norm()
-        result = original_clip(parameters, max_norm, *args, **kwargs)
-        observations.append((before, actual_norm()))
-        return result
+            before = actual_norm()
+            recording = True
+            try:
+                result = original_clip(parameters, *args, **kwargs)
+            finally:
+                recording = False
+            observations.append((before, actual_norm()))
+            return result
 
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip)
+        return clip
+
+    for name in ("clip_grad_norm_", "clip_grads_with_norm_"):
+        monkeypatch.setattr(
+            torch.nn.utils, name, instrument(getattr(torch.nn.utils, name))
+        )
     return observations
 
 

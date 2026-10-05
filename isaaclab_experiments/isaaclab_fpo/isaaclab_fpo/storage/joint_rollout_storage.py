@@ -31,6 +31,8 @@ class JointRolloutStorage(RolloutStorage):
             self.action_latent = None
             self.action_mean = None
             self.action_log_prob = None
+            self.action_std = None
+            self.aux_weight = None
 
     def __init__(
         self,
@@ -69,6 +71,10 @@ class JointRolloutStorage(RolloutStorage):
         self.action_log_probs = torch.zeros(
             num_transitions_per_env, num_envs, 1, device=self.device
         )
+        # Optional for callers that still use a fixed scalar Gaussian scale.
+        # FSPPOJoint always saves the behavior standard deviation explicitly.
+        self.action_stds = torch.zeros_like(self.action_means)
+        self.aux_weights = torch.ones_like(self.action_log_probs)
 
     def add_transitions(self, transition: Transition):
         """Copy a complete joint-policy transition into the next rollout slot.
@@ -125,6 +131,14 @@ class JointRolloutStorage(RolloutStorage):
         self.action_latents[self.step].copy_(transition.action_latent)
         self.action_means[self.step].copy_(transition.action_mean)
         self.action_log_probs[self.step].copy_(transition.action_log_prob)
+        if transition.action_std is not None:
+            self.action_stds[self.step].copy_(transition.action_std)
+        else:
+            self.action_stds[self.step].zero_()
+        if transition.aux_weight is not None:
+            self.aux_weights[self.step].copy_(transition.aux_weight)
+        else:
+            self.aux_weights[self.step].fill_(1.0)
 
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
@@ -181,6 +195,8 @@ class JointRolloutStorage(RolloutStorage):
         action_latents = self.action_latents.flatten(0, 1)
         action_means = self.action_means.flatten(0, 1)
         action_log_probs = self.action_log_probs.flatten(0, 1)
+        action_stds = self.action_stds.flatten(0, 1)
+        aux_weights = self.aux_weights.flatten(0, 1)
 
         base_mini_batch_size, num_larger_batches = divmod(batch_size, num_mini_batches)
         for _ in range(num_epochs):
@@ -195,6 +211,7 @@ class JointRolloutStorage(RolloutStorage):
                 start = stop
 
                 yield {
+                    "transition_indices": batch_indices,
                     "obs": observations[batch_indices],
                     "critic_obs": critic_observations[batch_indices],
                     "actions": actions[batch_indices],
@@ -204,6 +221,8 @@ class JointRolloutStorage(RolloutStorage):
                     "action_latents": action_latents[batch_indices],
                     "action_means": action_means[batch_indices],
                     "action_log_probs": action_log_probs[batch_indices],
+                    "action_stds": action_stds[batch_indices],
+                    "aux_weights": aux_weights[batch_indices],
                 }
 
     def recurrent_mini_batch_generator(self, *args, **kwargs):

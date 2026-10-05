@@ -54,6 +54,10 @@ def make_transition(step: int, num_envs: int) -> JointRolloutStorage.Transition:
     transition.action_latent = torch.stack([identifiers, identifiers + 1000.0], dim=-1)
     transition.action_mean = transition.actions + 2000.0
     transition.action_log_prob = (identifiers - 3000.0).unsqueeze(-1)
+    transition.action_std = torch.stack(
+        [0.1 + 0.01 * identifiers, 0.2 + 0.02 * identifiers], dim=-1
+    )
+    transition.aux_weight = (0.25 + 0.5 * identifiers).unsqueeze(-1)
     return transition
 
 
@@ -101,15 +105,21 @@ def test_joint_storage_copies_data_reuses_gae_and_keeps_all_uneven_batches(
     expected_latent = first_transition.action_latent.clone()
     expected_mean = first_transition.action_mean.clone()
     expected_log_prob = first_transition.action_log_prob.clone()
+    expected_std = first_transition.action_std.clone()
+    expected_weight = first_transition.aux_weight.clone()
     storage.add_transitions(first_transition)
 
     # A caller reuses and mutates its transition object after this copy.
     first_transition.action_latent.zero_()
     first_transition.action_mean.zero_()
     first_transition.action_log_prob.zero_()
+    first_transition.action_std.zero_()
+    first_transition.aux_weight.zero_()
     assert torch.equal(storage.action_latents[0], expected_latent)
     assert torch.equal(storage.action_means[0], expected_mean)
     assert torch.equal(storage.action_log_probs[0], expected_log_prob)
+    assert torch.equal(storage.action_stds[0], expected_std)
+    assert torch.equal(storage.aux_weights[0], expected_weight)
 
     for step in range(1, 3):
         storage.add_transitions(make_transition(step, num_envs=2))
@@ -146,21 +156,14 @@ def test_joint_storage_copies_data_reuses_gae_and_keeps_all_uneven_batches(
     monkeypatch.setattr(torch, "randperm", fake_randperm)
     batches = list(storage.mini_batch_generator(num_mini_batches=4, num_epochs=2))
 
-    expected_keys = {
-        "obs",
-        "critic_obs",
-        "actions",
-        "values",
-        "advantages",
-        "returns",
-        "action_latents",
-        "action_means",
-        "action_log_probs",
-    }
     assert calls == [6, 6]
     assert len(batches) == 8
     assert [batch["obs"].shape[0] for batch in batches] == [2, 2, 1, 1] * 2
-    assert all(set(batch) == expected_keys for batch in batches)
+    for batch in batches:
+        identifiers = batch["action_latents"][:, 0]
+        assert torch.allclose(batch["action_stds"][:, 0], 0.1 + 0.01 * identifiers)
+        assert torch.allclose(batch["action_stds"][:, 1], 0.2 + 0.02 * identifiers)
+        assert torch.allclose(batch["aux_weights"][:, 0], 0.25 + 0.5 * identifiers)
     first_epoch_ids = torch.cat(
         [batch["action_latents"][:, 0] for batch in batches[:4]]
     )

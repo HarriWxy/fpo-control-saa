@@ -20,7 +20,11 @@ class FpoRslRlPpoActorCriticCfg:
     """Configuration for the PPO actor-critic networks."""
 
     class_name: str = "ActorCritic"
-    """The policy class name (``ActorCritic``, ``IMFActorCritic`` or ``PMFActorCritic``)."""
+    """Policy class, including residual-Gaussian and fixed-codebook joint PPO variants.
+
+    ``GaussianResidualPMFActorCritic`` uses a Gaussian backbone;
+    ``CodebookPMFActorCritic`` uses a fixed finite latent prior.
+    """
 
     init_noise_std: float = 1.0
     """The initial noise standard deviation for the policy."""
@@ -102,6 +106,31 @@ class FpoRslRlPpoActorCriticCfg:
     """Standard deviation of Gaussian noise added to actions during training.
     Perturbs actions with random noise, which can be interpreted as an entropy
     regularizer."""
+
+    codebook_size: int = 8
+    """Number of fixed latent codes for ``CodebookPMFActorCritic``."""
+
+    codebook_seed: int = 12345
+    """Seed used to generate the fixed latent codebook independently of the training RNG."""
+
+    learn_action_perturb_std: bool = False
+    """Learn a bounded public-action std per coordinate in the residual Gaussian policy.
+
+    Only ``GaussianResidualPMFActorCritic`` consumes this field. When enabled,
+    the joint algorithm must not also apply the rollout noise-annealing schedule.
+    """
+
+    action_perturb_std_min: float = 0.05
+    """Lower bound of the residual policy's learned conditional Gaussian std."""
+
+    action_perturb_std_max: float = 2.0
+    """Upper bound of the residual policy's learned conditional Gaussian std."""
+
+    gaussian_residual_scale: float = 1.0
+    """Constant scale of the zero-initialized pMF residual beside the Gaussian mean.
+
+    Zero disables the residual and gives a Gaussian-only architecture ablation.
+    """
 
     # Improved Mean Flow (iMF) parameters.  They are ignored by the default
     # ``ActorCritic``/``FPO`` pair and activated only by
@@ -185,7 +214,14 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     """Algorithm class name for the selected policy optimization variant.
 
     Supported names include ``FPO``, ``IMFFPO``, ``PMFFPO``, ``FSPPO``,
-    ``FSPPOJoint``, and ``FSPPOJointEndpoint``.
+    ``FSPPOJoint``, ``FSPPOJointEndpoint``, and ``FSPPOCodebook``.
+    """
+
+    fsppo_codebook_ratio_mode: Literal["joint", "marginal"] = "marginal"
+    """Likelihood ratio used by ``FSPPOCodebook``.
+
+    ``joint`` conditions on the sampled code; ``marginal`` evaluates the exact
+    action likelihood by summing over the fixed codebook.
     """
 
     num_learning_epochs: int = 16
@@ -416,6 +452,37 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     The default leaves the exact joint-Gaussian PPO objective unmodified.
     """
 
+    fsppo_joint_aux_weighting: Literal["uniform", "advantage_exp"] = "uniform"
+    """Use uniform or capped, detached exponential-advantage pMF weights.
+
+    Exponential weights are computed once over the entire rollout and reused
+    across PPO epochs. They approximate reward-weighted transport distillation,
+    rather than an exact state-normalized Gibbs policy projection.
+    """
+
+    fsppo_joint_aux_temperature: float = 1.0
+    """Positive temperature for normalized-advantage exponential weights."""
+
+    fsppo_joint_aux_weight_clip: float = 20.0
+    """Upper cap applied after the rollout weights are mean-normalized.
+
+    The cap can reduce their final mean below one. It must be at least one.
+    """
+
+    fsppo_joint_aux_target: Literal["actions", "means"] = "actions"
+    """Fit noisy raw actions or saved noise-free behavior transport means.
+
+    ``means`` avoids distilling the final conditional Gaussian into the map and
+    injecting it again at rollout. It is an approximate reward-aware transport
+    target; it is not the exact Gibbs target over executed actions.
+    """
+
+    fsppo_joint_entropy_coef: float = 0.0
+    """Optional conditional Gaussian entropy bonus for joint PPO.
+
+    This is H(action | observation, latent), not marginal action entropy.
+    """
+
     fsppo_joint_adv_v_loss_coef: float = 0.0
     """Weight for positive-advantage pMF instantaneous-velocity regression.
 
@@ -555,6 +622,7 @@ class FpoRslRlOnPolicyRunnerCfg:
 
     Available modes:
     - "zero": Use zeros for initial noise
+    - "mean": Use the deterministic mixture mean (``CodebookPMFActorCritic`` only)
     - "fixed_seed": Use fixed random seed for reproducible noise
     - "random": Use random noise (different each time)
     """

@@ -18,6 +18,7 @@ import isaaclab_fpo
 from isaaclab_fpo.algorithms import (
     FPO,
     FSPPO,
+    FSPPOCodebook,
     FSPPOJoint,
     FSPPOJointEndpoint,
     IMFFPO,
@@ -29,7 +30,9 @@ if TYPE_CHECKING:
 from isaaclab_fpo.env import VecEnv
 from isaaclab_fpo.modules import (
     ActorCritic,
+    CodebookPMFActorCritic,
     EmpiricalNormalization,
+    GaussianResidualPMFActorCritic,
     IMFActorCritic,
     PMFActorCritic,
 )
@@ -74,10 +77,13 @@ class OnPolicyRunner:
             "ActorCritic": ActorCritic,
             "IMFActorCritic": IMFActorCritic,
             "PMFActorCritic": PMFActorCritic,
+            "CodebookPMFActorCritic": CodebookPMFActorCritic,
+            "GaussianResidualPMFActorCritic": GaussianResidualPMFActorCritic,
         }
         algorithm_classes = {
             "FPO": FPO,
             "FSPPO": FSPPO,
+            "FSPPOCodebook": FSPPOCodebook,
             "FSPPOJoint": FSPPOJoint,
             "FSPPOJointEndpoint": FSPPOJointEndpoint,
             "IMFFPO": IMFFPO,
@@ -103,6 +109,8 @@ class OnPolicyRunner:
             ActorCritic: (FPO,),
             IMFActorCritic: (IMFFPO,),
             PMFActorCritic: (PMFFPO, FSPPO, FSPPOJoint, FSPPOJointEndpoint),
+            CodebookPMFActorCritic: (FSPPOCodebook,),
+            GaussianResidualPMFActorCritic: (FSPPOJoint,),
         }
         if algorithm_class not in allowed_algorithms[policy_class]:
             allowed_names = sorted(

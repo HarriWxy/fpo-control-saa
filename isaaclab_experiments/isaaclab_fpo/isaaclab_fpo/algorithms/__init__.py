@@ -6,6 +6,7 @@
 """Implementation of different RL agents."""
 
 from .fpo import FPO, FSPPO, IMFFPO, PMFFPO
+from .fsppo_codebook import FSPPOCodebook
 from .fsppo_joint import FSPPOJoint
 from .fsppo_joint_endpoint import FSPPOJointEndpoint
 
@@ -16,4 +17,5 @@ __all__ = [
     "PMFFPO",
     "FSPPOJoint",
     "FSPPOJointEndpoint",
+    "FSPPOCodebook",
 ]
