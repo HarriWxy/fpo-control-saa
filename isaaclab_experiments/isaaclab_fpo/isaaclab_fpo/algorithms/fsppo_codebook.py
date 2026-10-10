@@ -91,6 +91,11 @@ class FSPPOCodebook(FSPPOJoint):
         self.policy.validate_codebook()
         if self.storage.step != self.storage.num_transitions_per_env:
             raise RuntimeError("FSPPOCodebook.update requires a complete rollout")
+        indices = self.storage.component_indices.flatten()
+        if ((indices < 0) | (indices >= self.policy.codebook_size)).any():
+            raise RuntimeError("Stored codebook component index is outside the fixed prior")
+        if not torch.equal(self.storage.action_latents.flatten(0, 1), self.policy.latent_codebook[indices]):
+            raise RuntimeError("Stored codebook component indices do not match the behavior latents")
         self._validate_replay()
         with torch.no_grad():
             observations = self.storage.observations.flatten(0, 1)
@@ -100,13 +105,44 @@ class FSPPOCodebook(FSPPOJoint):
                 part = slice(start, start + self.probe_size)
                 means = self.policy.component_means(observations[part])
                 cached[part].copy_(self.policy.component_action_log_probs(actions[part], means))
-            selected = cached.gather(1, self.storage.component_indices.flatten().unsqueeze(-1))
+            if not torch.isfinite(cached).all():
+                raise FloatingPointError(
+                    "Non-finite cached codebook densities before optimizer update; "
+                    f"iteration={self.update_counter}, sigma={self.sigma:.6g}, "
+                    f"nonfinite_components={int((~torch.isfinite(cached)).sum())}"
+                )
+            selected = cached.gather(1, indices.unsqueeze(-1))
+            behavior_log_probs = self.storage.action_log_probs.flatten(0, 1)
+            dense_log_prob_error = float((selected - behavior_log_probs).abs().max())
+            mismatch = ~torch.isclose(selected, behavior_log_probs, rtol=1e-4, atol=1e-4)
+            fallback_steps = mismatch.reshape(self.storage.num_transitions_per_env, self.storage.num_envs).any(dim=1)
+            fallback_steps = fallback_steps.nonzero().flatten().tolist()
+            # All-K GEMMs can round differently from single-code collection.
+            # Re-evaluate affected steps using the actual rollout batch size
+            # and single-code layout; retain the original density tolerances.
+            for step in fallback_steps:
+                obs = self.storage.observations[step]
+                raw_actions = self.storage.actions[step]
+                for component, code in enumerate(self.policy.latent_codebook):
+                    latents = code.expand(self.storage.num_envs, -1).contiguous()
+                    mean = self.policy.transport_actions(obs, latents)
+                    self.storage.old_component_log_probs[step, :, component].copy_(
+                        self.policy.conditional_action_log_prob(raw_actions, mean).squeeze(-1)
+                    )
+            selected = cached.gather(1, indices.unsqueeze(-1))
             if not torch.isfinite(cached).all() or not torch.allclose(
-                selected, self.storage.action_log_probs.flatten(0, 1), rtol=1e-4, atol=1e-4
+                selected, behavior_log_probs, rtol=1e-4, atol=1e-4
             ):
-                raise RuntimeError("Cached codebook densities do not match the behavior sampler")
+                raise RuntimeError(
+                    "Cached codebook densities do not match the behavior sampler after rollout-layout replay; "
+                    f"iteration={self.update_counter}, sigma={self.sigma:.6g}, "
+                    f"max_log_prob_error={float((selected - behavior_log_probs).abs().max()):.6g}, "
+                    f"nonfinite_components={int((~torch.isfinite(cached)).sum())}"
+                )
             self.storage.component_log_probs_ready = True
         result = super().update(obs_normalizer, privileged_obs_normalizer)
+        result["metrics"]["codebook/cache_replay_fallback_steps"] = len(fallback_steps)
+        result["metrics"]["codebook/cache_selected_log_prob_error"] = dense_log_prob_error
         # This variant does not compute the legacy continuous-prior L1 map cost.
         result["metrics"].pop("joint/map_kl_train", None)
         result["metrics"].pop("joint/legacy_map_l1_train", None)
