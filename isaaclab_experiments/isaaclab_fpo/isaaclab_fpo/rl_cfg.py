@@ -21,7 +21,7 @@ class FpoRslRlPpoActorCriticCfg:
 
     class_name: str = "ActorCritic"
     """Policy class, including residual-Gaussian and fixed-codebook joint PPO variants.
-
+    ``ActorCritic``, ``IMFActorCritic`` or ``PMFActorCritic``,
     ``GaussianResidualPMFActorCritic`` uses a Gaussian backbone;
     ``CodebookPMFActorCritic`` uses a fixed finite latent prior.
     """
@@ -31,6 +31,21 @@ class FpoRslRlPpoActorCriticCfg:
 
     actor_hidden_dims: list[int] = MISSING
     """The hidden dimensions of the actor network."""
+
+    actor_architecture: Literal["mlp", "time_conditioned_mlp"] = "mlp"
+    """Actor backbone. ``mlp`` preserves the original checkpoint layout.
+
+    ``time_conditioned_mlp`` encodes Fourier time features with an MLP and
+    uses them to scale and shift normalized features in every residual block.
+    It supports CFM, iMF and pMF with their existing time and output-head contracts.
+    """
+
+    actor_time_condition_dim: int = 128
+    """Learned time-condition width for ``time_conditioned_mlp``; must be positive.
+
+    This changes the learned representation width without increasing the
+    Fourier frequencies controlled by ``timestep_embed_dim``.
+    """
 
     critic_hidden_dims: list[int] = MISSING
     """The hidden dimensions of the critic network."""
@@ -54,7 +69,9 @@ class FpoRslRlPpoActorCriticCfg:
     timestep_embed_dim: int = 8
     """Dimension of the timestep embedding for the flow network. Default is 8.
 
-    When > 0, adds a learned embedding of the flow timestep t to the actor network input.
+    When > 0, adds fixed sine/cosine features of flow time to the actor input.
+    ``time_conditioned_mlp`` requires a positive even dimension and learns an
+    additional projection of these features inside the actor.
     This allows the network to condition its output on the current denoising step.
     All canonical locomotion baselines (Nov 2025) used timestep_embed_dim=8.
     Set to 0 to disable timestep conditioning.

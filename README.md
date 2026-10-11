@@ -66,3 +66,22 @@ The `isaaclab_fpo` package adapts code from rsl_rl and IsaacLab (VecEnv wrapper,
 | [robosuite](https://github.com/ARISE-Initiative/robosuite) | MIT | Vendored under `thirdparty/robosuite/` (minor modifications, see `CHANGES.txt`) | Simulation environments for manipulation tasks |
 | [DPPO](https://github.com/irom-lab/dppo) | MIT | Adapted file (`src/vit.py`) | Vision Transformer encoder |
 | [DexMimicGen](https://github.com/NVlabs/dexmimicgen) | NVIDIA Source Code License (non-commercial) | Cloned at setup time | Dexterous manipulation data generation |
+
+**核心区别：`FSPPOJoint` 的 `aux_loss` 是额外的回归梯度；`FPO` 的 CFM loss 则用于构造策略比率，是策略梯度的计算路径。**
+
+| | FSPPOJoint `aux_loss` | FPO `cfm loss` |
+|---|---|---|
+| 进入更新的方式 | `PPO surrogate + λ_aux × pMF loss` | `ρ = exp(CFM_old − CFM_current)`，再用 `ρ` 计算 PPO/SPO/ASPO surrogate |
+| 优势 \(A\) 的作用 | aux 梯度**不乘 \(A\)**，对好坏动作都做回归 | \(A\) 决定方向：在未裁剪且 \(\rho\approx1\) 时，正优势降低该动作的 CFM loss，负优势提高它 |
+| 对 actor 的影响 | 与 PPO 梯度相加，可能协同，也可能冲突；PPO 比率不包含 aux | CFM 梯度就是该 surrogate 传到 actor 的梯度路径 |
+
+具体地，FSPPOJoint 用保存的 latent、动作和条件高斯 log-prob 计算联合策略的 PPO 比率；`aux_loss` 另用 rollout 动作及新采样的噪声、时间计算 pMF 的 \(u/v\) 回归误差，并在同一次 `backward()` 中更新共享 actor。[fsppo_joint.py](/root/R2A/Algos/fpo-control-saa/isaaclab_experiments/isaaclab_fpo/isaaclab_fpo/algorithms/fsppo_joint.py:463) [actor_critic.py](/root/R2A/Algos/fpo-control-saa/isaaclab_experiments/isaaclab_fpo/isaaclab_fpo/modules/actor_critic.py:1028) 因此，即使某些样本的 PPO 梯度被裁剪，aux 仍可能推动 actor；它也会参与全模型梯度范数裁剪和候选步预算检查。
+
+FPO **没有单独的 `+ λ × mean(CFM loss)` 项**。对未触发裁剪的样本，最小化的 surrogate \(L=-A\rho\) 满足 \(\nabla_\theta L=A\rho\nabla_\theta\mathrm{CFM}_{current}\)。实际的 PPO/ASPO 分支和 CFM 裁剪会改变这一局部关系；这里的 CFM 比率也只是分数比替代量，并非精确动作概率比。[fpo.py](/root/R2A/Algos/fpo-control-saa/isaaclab_experiments/isaaclab_fpo/isaaclab_fpo/algorithms/fpo.py:529)
+
+**当前默认 `fsppo_joint_aux_loss_coef=0`，所以 aux 完全不产生梯度。**[rl_cfg.py](/root/R2A/Algos/fpo-control-saa/isaaclab_experiments/isaaclab_fpo/isaaclab_fpo/rl_cfg.py:413) 你工作区中的[校验代码](/root/R2A/Algos/fpo-control-saa/isaaclab_experiments/isaaclab_fpo/isaaclab_fpo/algorithms/fsppo_joint.py:103)已注释掉非负检查：若设负系数，会对**所有**样本反向优化 pMF 回归，不能等同于 FPO 对负优势动作的更新。
+
+以上是当前源码的梯度路径分析；两个 loss 的标量大小不能直接代表各自对策略更新的贡献，实际比较应看 actor 上两项梯度的范数及夹角。
+
+
+

@@ -13,6 +13,8 @@ from torch import nn
 
 from isaaclab_fpo.utils import resolve_nn_activation
 
+from .time_conditioned_mlp import TimeConditionedMLP
+
 if TYPE_CHECKING:
     from isaaclab_fpo.rl_cfg import FpoRslRlPpoActorCriticCfg
 
@@ -73,39 +75,62 @@ class ActorCritic(nn.Module):
         # Policy Network: Actor
         actor_hidden_dims = cfg.actor_hidden_dims
         critic_hidden_dims = cfg.critic_hidden_dims
+        # Saved agent.pkl configs can predate the optional actor backbone.
+        actor_architecture = getattr(cfg, "actor_architecture", "mlp")
         mlp_input_dim_a = (
             num_actor_obs
             + self.actor_num_time_embeddings * self.timestep_embed_dim
             + num_actions
         )
         mlp_input_dim_c = num_critic_obs
-        actor_layers = []
-        actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
-        actor_layers.append(activation)
-        for layer_index in range(len(actor_hidden_dims)):
-            if layer_index == len(actor_hidden_dims) - 1:
-                actor_layers.append(
-                    nn.Linear(
-                        actor_hidden_dims[layer_index],
-                        self.actor_output_multiplier * num_actions,
+        if actor_architecture == "mlp":
+            actor_layers = []
+            actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
+            actor_layers.append(activation)
+            for layer_index in range(len(actor_hidden_dims)):
+                if layer_index == len(actor_hidden_dims) - 1:
+                    actor_layers.append(
+                        nn.Linear(
+                            actor_hidden_dims[layer_index],
+                            self.actor_output_multiplier * num_actions,
+                        )
                     )
-                )
-            else:
-                actor_layers.append(
-                    nn.Linear(
-                        actor_hidden_dims[layer_index],
-                        actor_hidden_dims[layer_index + 1],
+                else:
+                    actor_layers.append(
+                        nn.Linear(
+                            actor_hidden_dims[layer_index],
+                            actor_hidden_dims[layer_index + 1],
+                        )
                     )
+                    actor_layers.append(activation)
+            self.actor = nn.Sequential(*actor_layers)
+            final_layer = self.actor[-1]
+        elif actor_architecture == "time_conditioned_mlp":
+            if self.timestep_embed_dim % 2:
+                raise ValueError(
+                    "time_conditioned_mlp requires an even timestep_embed_dim"
                 )
-                actor_layers.append(activation)
-        self.actor = nn.Sequential(*actor_layers)
+            self.actor = TimeConditionedMLP(
+                num_observations=num_actor_obs,
+                num_actions=num_actions,
+                time_embedding_dim=self.actor_num_time_embeddings
+                * self.timestep_embed_dim,
+                output_dim=self.actor_output_multiplier * num_actions,
+                hidden_dims=actor_hidden_dims,
+                condition_dim=getattr(cfg, "actor_time_condition_dim", 128),
+                activation=cfg.activation,
+            )
+            final_layer = self.actor.output_layer
+        else:
+            raise ValueError(
+                f"Unsupported actor_architecture: {actor_architecture!r}"
+            )
 
         # Apply scaling to actor's final layer weights
         if (
             cfg.actor_final_layer_weight_scale is not None
             and cfg.actor_final_layer_weight_scale != 1.0
         ):
-            final_layer = self.actor[-1]
             assert isinstance(final_layer, nn.Linear), (
                 "Expected final layer to be Linear"
             )

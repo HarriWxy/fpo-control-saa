@@ -43,6 +43,39 @@ sample.  The implementation logs the squared map distance under
 `Metrics/map_trust_region/distance`; it is an experimental penalty
 instantiation, not by itself a claim of monotonic policy improvement.
 
+### Time-Conditioned Residual Actor
+
+The default actor remains the original MLP. To encode flow time with a
+learned MLP and inject it into every residual block through adaptive
+normalization, select the optional actor backbone:
+
+```bash
+python isaaclab_fpo/scripts/train.py \
+    --task Isaac-Velocity-Flat-H1-v0 --headless \
+    agent.policy.actor_architecture=time_conditioned_mlp \
+    agent.policy.actor_time_condition_dim=128
+```
+
+The same overrides work with `--algorithm imf_fpo`, `pmf_fpo`, `fsppo`,
+`fsppo_joint`, and `fsppo_joint_endpoint`. Each variant keeps its existing
+time conditions, output heads, flow sampling, and action scaling. The time
+encoder belongs to the actor, so frozen old-policy copies and EMA include
+its parameters. The new backbone uses no dropout or batch normalization.
+
+`actor_hidden_dims` sets the residual block widths; differing widths use
+shortcut projections. `actor_time_condition_dim` sets the learned time
+representation width. Keep `timestep_embed_dim=8` initially: increasing that
+Fourier dimension also increases its maximum frequency. The new backbone
+requires a positive even Fourier dimension.
+
+New-backbone checkpoints require the same architecture and widths when
+loading. Playback tools that restore `params/agent.pkl` recover the saved
+configuration. For SRB's native launcher, set `actor_architecture` and
+`actor_time_condition_dim` in the YAML `policy` section passed through
+`--fpo-config`. Existing MLP checkpoints continue to use `actor_architecture=mlp`.
+This architecture is an experimental option; improved training performance
+must be established by a controlled comparison.
+
 ### Velocity-Conditioned Locomotion
 
 ```bash
