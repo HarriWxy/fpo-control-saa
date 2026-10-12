@@ -8,6 +8,7 @@
 from .actor_critic import ActorCritic, IMFActorCritic, PMFActorCritic
 from .codebook_actor_critic import CodebookPMFActorCritic
 from .gaussian_residual_actor_critic import GaussianResidualPMFActorCritic
+from .learned_std_actor_critic import LearnedStdPMFActorCritic
 from .normalizer import EmpiricalNormalization
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "PMFActorCritic",
     "CodebookPMFActorCritic",
     "GaussianResidualPMFActorCritic",
+    "LearnedStdPMFActorCritic",
     "EmpiricalNormalization",
 ]

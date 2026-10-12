@@ -23,6 +23,7 @@ class FpoRslRlPpoActorCriticCfg:
     """Policy class, including residual-Gaussian and fixed-codebook joint PPO variants.
     ``ActorCritic``, ``IMFActorCritic`` or ``PMFActorCritic``,
     ``GaussianResidualPMFActorCritic`` uses a Gaussian backbone;
+    ``LearnedStdPMFActorCritic`` retains the pMF flow with a conditional action scale;
     ``CodebookPMFActorCritic`` uses a fixed finite latent prior.
     """
 
@@ -131,17 +132,17 @@ class FpoRslRlPpoActorCriticCfg:
     """Seed used to generate the fixed latent codebook independently of the training RNG."""
 
     learn_action_perturb_std: bool = False
-    """Learn a bounded public-action std per coordinate in the residual Gaussian policy.
+    """Learn a bounded public-action std per coordinate in conditional Gaussian policies.
 
-    Only ``GaussianResidualPMFActorCritic`` consumes this field. When enabled,
+    ``GaussianResidualPMFActorCritic`` and ``LearnedStdPMFActorCritic`` consume this field. When enabled,
     the joint algorithm must not also apply the rollout noise-annealing schedule.
     """
 
     action_perturb_std_min: float = 0.05
-    """Lower bound of the residual policy's learned conditional Gaussian std."""
+    """Lower bound of the learned conditional Gaussian std."""
 
     action_perturb_std_max: float = 2.0
-    """Upper bound of the residual policy's learned conditional Gaussian std."""
+    """Upper bound of the learned conditional Gaussian std."""
 
     gaussian_residual_scale: float = 1.0
     """Constant scale of the zero-initialized pMF residual beside the Gaussian mean.
@@ -231,7 +232,8 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     """Algorithm class name for the selected policy optimization variant.
 
     Supported names include ``FPO``, ``IMFFPO``, ``PMFFPO``, ``FSPPO``,
-    ``FSPPOJoint``, ``FSPPOJointEndpoint``, and ``FSPPOCodebook``.
+    ``FSPPOJoint``, ``FSPPOJointAligned``, ``FSPPOJointEndpoint``,
+    ``FSPPOCodebook``, and ``PMFPMD``.
     """
 
     fsppo_codebook_ratio_mode: Literal["joint", "marginal"] = "marginal"
@@ -519,8 +521,9 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     action_perturb_std_decay_env_steps: int = 0
     """Global environment transitions over which to anneal action noise.
 
-    A value of zero disables annealing. This schedule only applies to
-    FSPPOJoint and is held constant for each complete rollout and its PPO update.
+    A value of zero disables annealing. This schedule applies to fixed-noise
+    Joint and PMD variants and is held constant for each complete rollout and
+    its subsequent actor update.
     """
 
     fsppo_joint_endpoint_mae_coef: float = 0.1
@@ -530,6 +533,46 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     does not use the joint map-budget fields or ``fsppo_joint_map_samples``.
     This field is ignored by the other algorithm variants.
     """
+
+    pmd_num_candidates: int = 8
+    """Old one-NFE mean candidates sampled independently for each state."""
+
+    pmd_q_noise_samples: int = 4
+    """Independent terminal Gaussian samples used to smooth each candidate Q."""
+
+    pmd_q_hidden_dims: list[int] = [256, 256]
+    """Hidden dimensions of the additional action-conditioned Q MLP."""
+
+    pmd_q_learning_rate: float = 1e-3
+    """Learning rate of Q, independent of the actor and value optimizers."""
+
+    pmd_value_learning_rate: float = 1e-3
+    """Learning rate of the state-value bootstrap critic in PMFPMD."""
+
+    pmd_q_epochs: int = 4
+    """Q fitting passes over frozen on-policy lambda-return targets."""
+
+    pmd_q_warmup_updates: int = 10
+    """Initial rollouts that train V/Q while leaving the actor unchanged."""
+
+    pmd_q_holdout_fraction: float = 0.1
+    """Within-rollout fraction held out from Q fitting for reliability logs."""
+
+    pmd_projection_epochs: int = 4
+    """Pure weighted pMF passes over frozen candidates and state-wise weights."""
+
+    pmd_batch_size: int = 256
+    """State microbatch size for Q, candidate scoring and projection.
+
+    Actor gradients accumulate within ``num_mini_batches`` before one optimizer
+    step, so this memory bound does not alter the actor's update-step budget.
+    """
+
+    pmd_temperature: float = 1.0
+    """Initial positive Q softmax temperature in return units."""
+
+    pmd_min_ess_fraction: float = 0.5
+    """Minimum state-wise ESS divided by the number of candidate means."""
 
     ema_decay: float = 0.95
     """EMA decay rate for exponential moving average of flow model weights. Default is 0.95.

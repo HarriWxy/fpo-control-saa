@@ -7,6 +7,7 @@ Patches applied to isaaclab.utils.dict.update_class_from_dict:
 """
 
 from collections.abc import Iterable, Mapping
+from importlib import import_module
 
 
 def _is_missing(obj):
@@ -17,7 +18,7 @@ def _is_missing(obj):
 def apply_isaaclab_patches():
     """Apply monkey-patches to isaaclab.utils.dict at import time."""
     import isaaclab.utils.dict as dict_module
-    from isaaclab.utils.string import callable_to_string, string_to_callable
+    from isaaclab.utils.string import string_to_callable
 
     def update_class_from_dict(obj, data: dict, _ns: str = "") -> None:
         for key, value in data.items():
@@ -69,9 +70,18 @@ def apply_isaaclab_patches():
                 raise KeyError(f"[Config]: Key not found under namespace: {key_ns}.")
 
     dict_module.update_class_from_dict = update_class_from_dict
+    # Isaac Lab 3 exposes from_dict as a direct alias, bound when the config
+    # classes are decorated. Existing config classes retain that old binding.
+    if hasattr(dict_module, "update_from_dict"):
+        dict_module.update_from_dict = update_class_from_dict
 
-    # Also patch the direct import in configclass.py, which has:
-    #   from .dict import update_class_from_dict
-    # Without this, configclass.from_dict() would still use the unpatched version.
-    import isaaclab.utils.configclass as configclass_module
-    configclass_module.update_class_from_dict = update_class_from_dict
+    # Also update the configclass module's direct import for older versions
+    # and the alias used when decorating new Isaac Lab 3 config classes.
+    # ``isaaclab.utils`` also exports a function named configclass. Importing
+    # through that package attribute can select the function instead of the
+    # module, leaving configclass.from_dict bound to the unpatched updater.
+    configclass_module = import_module("isaaclab.utils.configclass")
+    if hasattr(configclass_module, "update_class_from_dict"):
+        configclass_module.update_class_from_dict = update_class_from_dict
+    if hasattr(configclass_module, "update_from_dict"):
+        configclass_module.update_from_dict = update_class_from_dict

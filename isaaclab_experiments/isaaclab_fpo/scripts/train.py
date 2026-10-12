@@ -167,6 +167,10 @@ def main():
         agent_cfg.from_dict(agent_overrides)
     if env_overrides:
         env_cfg.from_dict(env_overrides)
+    if agent_cfg.algorithm.class_name == "PMFPMD":
+        if not hasattr(env_cfg, "compute_final_obs"):
+            raise ValueError("PMFPMD requires pre-reset final observations")
+        env_cfg.compute_final_obs = True
     agent_cfg.max_iterations = (
         args_cli.max_iterations
         if args_cli.max_iterations is not None

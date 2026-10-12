@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab_fpo.algorithms.fpo import FPO
-from isaaclab_fpo.modules import GaussianResidualPMFActorCritic, PMFActorCritic
+from isaaclab_fpo.modules import (
+    GaussianResidualPMFActorCritic,
+    LearnedStdPMFActorCritic,
+    PMFActorCritic,
+)
 from isaaclab_fpo.storage.joint_rollout_storage import JointRolloutStorage
 
 if TYPE_CHECKING:
@@ -24,7 +28,8 @@ class FSPPOJoint(FPO):
     it is not the marginal action log-ratio. With sigma held positive and
     fixed for each rollout and its update, the squared same-latent map cost
     divided by ``2 * sigma**2`` is the joint KL. The Gaussian-residual policy
-    instead permits a learned diagonal scale and uses its full Gaussian KL.
+    and optional learned-std flow policies permit a learned diagonal scale
+    and use its full Gaussian KL.
     Both KLs bound marginal action KL in expectation over the prior. The
     legacy PMF policy retains its historical L1 map budget for compatibility.
 
@@ -72,7 +77,7 @@ class FSPPOJoint(FPO):
             )
         decay_env_steps = cfg.action_perturb_std_decay_env_steps
         self.gaussian_residual_policy = isinstance(
-            policy, GaussianResidualPMFActorCritic
+            policy, (GaussianResidualPMFActorCritic, LearnedStdPMFActorCritic)
         )
         self.learn_action_std = (
             self.gaussian_residual_policy and policy.learn_action_perturb_std
@@ -568,7 +573,7 @@ class FSPPOJoint(FPO):
         if self.sigma_decay_env_steps > 0:
             contract["action_perturb_std_final"] = self.final_sigma
             contract["action_perturb_std_decay_env_steps"] = self.sigma_decay_env_steps
-        if self.gaussian_residual_policy:
+        if isinstance(self.policy, GaussianResidualPMFActorCritic):
             contract.update(
                 policy_class=type(self.policy).__name__,
                 learn_action_perturb_std=self.learn_action_std,
@@ -577,6 +582,14 @@ class FSPPOJoint(FPO):
                 gaussian_residual_scale=float(self.policy.gaussian_residual_scale),
                 actor_residual_scale=float(self.policy.actor.residual_scale),
                 actor_public_output_scale=float(self.policy.actor.public_output_scale),
+                budget_metric="conditional_gaussian_kl",
+            )
+        elif isinstance(self.policy, LearnedStdPMFActorCritic):
+            contract.update(
+                policy_class=type(self.policy).__name__,
+                learn_action_perturb_std=self.learn_action_std,
+                action_perturb_std_min=float(self.policy.action_perturb_std_min),
+                action_perturb_std_max=float(self.policy.action_perturb_std_max),
                 budget_metric="conditional_gaussian_kl",
             )
         return contract
@@ -648,19 +661,23 @@ class FSPPOJoint(FPO):
 
     @torch.no_grad()
     def _validate_replay(self) -> None:
-        obs = self.storage.observations.flatten(0, 1)
-        latents = self.storage.action_latents.flatten(0, 1)
-        means = self.storage.action_means.flatten(0, 1)
-        actions = self.storage.actions.flatten(0, 1)
-        log_probs = self.storage.action_log_probs.flatten(0, 1)
-        action_stds = self.storage.action_stds.flatten(0, 1)
-        for start in range(0, obs.shape[0], self.probe_size):
-            part = slice(start, start + self.probe_size)
-            replay = self.policy.transport_actions(obs[part], latents[part])
+        # Rollout sampling evaluates the actor once per environment step with
+        # batch size num_envs. Replay at that same shape: splitting the flattened
+        # rollout by probe_size can change GEMM kernels (for example, 256 rows
+        # during sampling versus 1024 here) and introduce enough FP32 rounding
+        # noise to fail the strict mean check despite unchanged policy weights.
+        for step in range(self.storage.num_transitions_per_env):
+            obs = self.storage.observations[step]
+            latents = self.storage.action_latents[step]
+            means = self.storage.action_means[step]
+            actions = self.storage.actions[step]
+            log_probs = self.storage.action_log_probs[step]
+            action_stds = self.storage.action_stds[step]
+            replay = self.policy.transport_actions(obs, latents)
             if self.gaussian_residual_policy:
                 if not torch.allclose(
-                    self._action_std().expand_as(action_stds[part]),
-                    action_stds[part],
+                    self._action_std().expand_as(action_stds),
+                    action_stds,
                     rtol=1e-5,
                     atol=1e-7,
                 ):
@@ -668,17 +685,17 @@ class FSPPOJoint(FPO):
                         "FSPPOJoint behavior replay mismatch: action scale changed"
                     )
                 log_prob = self.policy.conditional_action_log_prob(
-                    actions[part], replay, std=action_stds[part]
+                    actions, replay, std=action_stds
                 )
             else:
                 log_prob = self.policy.conditional_action_log_prob(
-                    actions[part], replay
+                    actions, replay
                 )
             if not torch.allclose(
-                replay, means[part], rtol=1e-4, atol=1e-6
-            ) or not torch.allclose(log_prob, log_probs[part], rtol=1e-4, atol=1e-4):
-                mean_error = float((replay - means[part]).abs().max())
-                log_prob_error = float((log_prob - log_probs[part]).abs().max())
+                replay, means, rtol=1e-4, atol=1e-6
+            ) or not torch.allclose(log_prob, log_probs, rtol=1e-4, atol=1e-4):
+                mean_error = float((replay - means).abs().max())
+                log_prob_error = float((log_prob - log_probs).abs().max())
                 raise RuntimeError(
                     "FSPPOJoint behavior replay mismatch: actor, latent, or raw action changed; "
                     f"max mean error={mean_error:.3g}, max log-prob error={log_prob_error:.3g}"
@@ -777,9 +794,10 @@ class FSPPOJoint(FPO):
         if self.gaussian_residual_policy and not self.enable_budget:
             # Saved behavior latents already give an empirical joint KL. Avoid
             # additional transport evaluations when this is diagnostic only.
-            map_kl = self._gaussian_kl(
-                mean, batch["action_means"], batch["action_stds"]
-            ).mean()
+            with torch.no_grad():
+                map_kl = self._gaussian_kl(
+                    mean, batch["action_means"], batch["action_stds"]
+                ).mean()
         else:
             noise = torch.randn(
                 obs.shape[0],

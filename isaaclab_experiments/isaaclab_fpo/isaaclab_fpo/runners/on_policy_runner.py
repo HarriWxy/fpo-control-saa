@@ -20,9 +20,11 @@ from isaaclab_fpo.algorithms import (
     FSPPO,
     FSPPOCodebook,
     FSPPOJoint,
+    FSPPOJointAligned,
     FSPPOJointEndpoint,
     IMFFPO,
     PMFFPO,
+    PMFPMD,
 )
 
 if TYPE_CHECKING:
@@ -34,6 +36,7 @@ from isaaclab_fpo.modules import (
     EmpiricalNormalization,
     GaussianResidualPMFActorCritic,
     IMFActorCritic,
+    LearnedStdPMFActorCritic,
     PMFActorCritic,
 )
 from isaaclab_fpo.utils import store_code_state
@@ -79,15 +82,18 @@ class OnPolicyRunner:
             "PMFActorCritic": PMFActorCritic,
             "CodebookPMFActorCritic": CodebookPMFActorCritic,
             "GaussianResidualPMFActorCritic": GaussianResidualPMFActorCritic,
+            "LearnedStdPMFActorCritic": LearnedStdPMFActorCritic,
         }
         algorithm_classes = {
             "FPO": FPO,
             "FSPPO": FSPPO,
             "FSPPOCodebook": FSPPOCodebook,
             "FSPPOJoint": FSPPOJoint,
+            "FSPPOJointAligned": FSPPOJointAligned,
             "FSPPOJointEndpoint": FSPPOJointEndpoint,
             "IMFFPO": IMFFPO,
             "PMFFPO": PMFFPO,
+            "PMFPMD": PMFPMD,
         }
         try:
             policy_class = policy_classes[train_cfg.policy.class_name]
@@ -108,9 +114,10 @@ class OnPolicyRunner:
         allowed_algorithms = {
             ActorCritic: (FPO,),
             IMFActorCritic: (IMFFPO,),
-            PMFActorCritic: (PMFFPO, FSPPO, FSPPOJoint, FSPPOJointEndpoint),
+            PMFActorCritic: (PMFFPO, FSPPO, FSPPOJoint, FSPPOJointEndpoint, PMFPMD),
             CodebookPMFActorCritic: (FSPPOCodebook,),
             GaussianResidualPMFActorCritic: (FSPPOJoint,),
+            LearnedStdPMFActorCritic: (FSPPOJointAligned,),
         }
         if algorithm_class not in allowed_algorithms[policy_class]:
             allowed_names = sorted(
@@ -173,6 +180,7 @@ class OnPolicyRunner:
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
         # Logging
         self.log_dir = log_dir
+        self.logger_type = getattr(self.cfg, "logger", "tensorboard").lower()
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
@@ -320,6 +328,7 @@ class OnPolicyRunner:
                         privileged_obs = obs
 
                     # process the step
+                    self._normalize_terminal_observations(infos)
                     self.alg.process_env_step(rewards, dones, infos)
                     process_time += time.perf_counter() - process_start
 
@@ -407,7 +416,7 @@ class OnPolicyRunner:
             # Clear episode infos
             ep_infos.clear()
             # Save code state
-            if it == start_iter and not self.disable_logs:
+            if it == start_iter and self.log_dir is not None and not self.disable_logs:
                 # obtain all the diff files
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
                 # if possible store them to wandb
@@ -693,6 +702,22 @@ class OnPolicyRunner:
                 f"{completed_env_steps}"
             )
 
+    def _normalize_terminal_observations(self, infos: dict) -> None:
+        """Normalize pre-reset bootstrap states without counting them twice."""
+        terminal = infos.get("terminal_critic_observations")
+        if terminal is None:
+            return
+        normalizer = (
+            self.privileged_obs_normalizer
+            if self.privileged_obs_type is not None else self.obs_normalizer
+        )
+        was_training = normalizer.training
+        try:
+            normalizer.eval()
+            infos["terminal_critic_observations"] = normalizer(terminal.to(self.device)).clone()
+        finally:
+            normalizer.train(was_training)
+
     def _validate_checkpoint_compatibility(
         self, loaded_dict: dict, *, require_online_state: bool = False
     ) -> None:
@@ -752,6 +777,9 @@ class OnPolicyRunner:
             or algorithm_state.get("sampler") != current_state.get("sampler")
         ):
             raise ValueError("FSPPOJoint checkpoint sampling contract mismatch")
+        for key in ("pmd_contract", "aligned_schedule", "aligned_desired_kl"):
+            if algorithm_state.get(key) != current_state.get(key):
+                raise ValueError(f"Checkpoint {key} mismatch")
         if "model_state_dict" not in loaded_dict:
             raise ValueError("FSPPOJoint checkpoint is missing model_state_dict")
         if require_online_state and "online_model_state_dict" not in loaded_dict:
@@ -948,33 +976,55 @@ class OnPolicyRunner:
         return checkpoints
 
     def evaluate_checkpoint(self, checkpoint_path, iteration):
-        """Evaluate a single checkpoint.
+        """Evaluate exactly the requested number of completed episodes per mode.
 
         Args:
             checkpoint_path: Path to the checkpoint file
             iteration: Iteration number of the checkpoint
 
         Returns:
-            Dictionary containing evaluation metrics for each mode
+            Dictionary containing evaluation metrics for each mode, or ``None``
+            on failure. Timeout rates are ``None`` if the environment does not
+            expose timeout information. The checkpoint's saved evaluation actor
+            (which may contain EMA weights) is used without action perturbation.
         """
+        import random
+
         import numpy as np
 
-        # Initialize state variables to avoid NameError in exception handler
         current_model_state = None
         current_obs_norm_state = None
         current_priv_obs_norm_state = None
+        current_modes = {}
+        eval_results = None
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
+        torch_rng_state = torch.random.get_rng_state()
+        cuda_rng_states = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
+        )
 
         try:
-            # Save current model and normalizer state
-            current_model_state = {k: v.clone() for k, v in self.alg.policy.state_dict().items()}
+            modules = [
+                self.alg.policy,
+                self.obs_normalizer,
+                self.privileged_obs_normalizer,
+            ]
+            current_modes = {
+                module: module.training for root in modules for module in root.modules()
+            }
+            current_model_state = self._clone_state_dict(self.alg.policy.state_dict())
             if self.empirical_normalization:
-                current_obs_norm_state = {k: v.clone() if isinstance(v, torch.Tensor) else v
-                                         for k, v in self.obs_normalizer.state_dict().items()}
-                current_priv_obs_norm_state = {k: v.clone() if isinstance(v, torch.Tensor) else v
-                                              for k, v in self.privileged_obs_normalizer.state_dict().items()}
+                current_obs_norm_state = self._clone_state_dict(
+                    self.obs_normalizer.state_dict()
+                )
+                current_priv_obs_norm_state = self._clone_state_dict(
+                    self.privileged_obs_normalizer.state_dict()
+                )
 
-            # Load checkpoint (this loads both model and normalizer)
-            loaded_dict = torch.load(checkpoint_path, weights_only=False)
+            loaded_dict = torch.load(
+                checkpoint_path, map_location=self.device, weights_only=False
+            )
             if (
                 self._is_fsppo_joint()
                 or loaded_dict.get("algorithm_class_name") == "FSPPOJoint"
@@ -982,10 +1032,11 @@ class OnPolicyRunner:
                 self._validate_checkpoint_compatibility(loaded_dict)
             self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
 
-            # Load normalizer state from checkpoint if available
-            if self.empirical_normalization and "obs_norm_state_dict" in loaded_dict:
+            if self.empirical_normalization:
                 self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
-                self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
+                self.privileged_obs_normalizer.load_state_dict(
+                    loaded_dict["privileged_obs_norm_state_dict"]
+                )
 
             # Note: post-warmup checkpoints have EMA weights baked into model_state_dict
             # (save() replaces actor weights with EMA shadow params after warmup).
@@ -993,112 +1044,140 @@ class OnPolicyRunner:
             # No need to do ema.store()/copy_to() here — that would overwrite the
             # checkpoint's weights with end-of-training shadow_params.
 
-            # Switch to eval mode
             self.eval_mode()
 
-            # Determine number of episodes for this eval
             num_episodes = getattr(self.cfg, "eval_episodes", 10)
+            if (
+                isinstance(num_episodes, bool)
+                or not isinstance(num_episodes, int)
+                or num_episodes <= 0
+            ):
+                raise ValueError("eval_episodes must be a positive integer")
 
-            # Get eval modes from config
-            eval_modes = getattr(self.cfg, "flow_eval_modes", ["zero", "fixed_seed", "random"])
+            eval_modes = getattr(
+                self.cfg, "flow_eval_modes", ["zero", "fixed_seed", "random"]
+            )
             eval_fixed_seed = getattr(self.cfg, "flow_eval_fixed_seed", 12345)
+            eval_seed = self.cfg.seed
+            if eval_fixed_seed is None:
+                eval_fixed_seed = eval_seed
+            quotas = torch.full(
+                (self.env.num_envs,),
+                num_episodes // self.env.num_envs,
+                dtype=torch.long,
+                device=self.device,
+            )
+            quotas[: num_episodes % self.env.num_envs] += 1
+            max_episode_length = getattr(self.env, "max_episode_length", 1000)
+            if not isinstance(max_episode_length, int) or max_episode_length <= 0:
+                raise ValueError("max_episode_length must be a positive integer")
+            max_steps = max_episode_length * (int(quotas.max()) + 1)
 
             eval_results = {}
 
             for mode in eval_modes:
-                # Reset environments for each mode
+                # Restart both policy noise and environment randomization for
+                # each mode, so mode ordering does not change initial states.
+                random.seed(eval_seed)
+                np.random.seed(eval_seed)
+                torch.manual_seed(eval_seed)
+                env_seed = getattr(self.env, "seed", None)
+                if callable(env_seed):
+                    env_seed(eval_seed)
                 obs, _ = self.env.reset()
                 obs = obs.to(self.device)
 
-                # Collect episodes for this mode
                 mode_rewards = []
                 mode_lengths = []
+                mode_timeouts = []
 
-                # Track episode data
-                episode_reward = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-                episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+                episode_reward = torch.zeros(
+                    self.env.num_envs, dtype=torch.float, device=self.device
+                )
+                episode_length = torch.zeros(
+                    self.env.num_envs, dtype=torch.float, device=self.device
+                )
+                episodes_per_env = torch.zeros(
+                    self.env.num_envs, dtype=torch.long, device=self.device
+                )
 
-                # Get max episode length
-                max_episode_length = self.env.max_episode_length if hasattr(self.env, 'max_episode_length') else 1000
-
-                # Run until we collect enough episodes
-                episodes_per_env = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
-                target_episodes_per_env = max(1, num_episodes // self.env.num_envs)
-
-                while (episodes_per_env < target_episodes_per_env).any():
+                for _ in range(max_steps):
+                    if not (episodes_per_env < quotas).any():
+                        break
                     with torch.no_grad():
-                        # Normalize observations if needed
-                        if self.cfg.empirical_normalization:
+                        if self.empirical_normalization:
                             norm_obs = self.obs_normalizer(obs)
                         else:
                             norm_obs = obs
-
-                        # Use flow matching with specified evaluation mode
                         actions = self.alg.policy.act_inference(
-                            norm_obs,
-                            eval_mode=mode,
-                            eval_fixed_seed=eval_fixed_seed
+                            norm_obs, eval_mode=mode, eval_fixed_seed=eval_fixed_seed
                         )
 
-                    # Step environment
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones, infos = self.env.step(
+                        actions.to(self.env.device)
+                    )
                     obs = obs.to(self.device)
 
-                    # Accumulate rewards and lengths
                     episode_reward += rewards.to(self.device)
                     episode_length += 1
 
-                    # Check for done episodes
-                    done_mask = (dones > 0) | (episode_length >= max_episode_length)
+                    # Isaac Lab autoresets only genuine terminal/truncated
+                    # environments. A local length cap cannot create episodes.
+                    done_mask = dones.to(self.device) > 0
+                    selected = done_mask & (episodes_per_env < quotas)
+                    mode_rewards.extend(episode_reward[selected].tolist())
+                    mode_lengths.extend(episode_length[selected].tolist())
+                    if "time_outs" in infos:
+                        mode_timeouts.extend(
+                            infos["time_outs"].to(self.device)[selected].tolist()
+                        )
+                    episodes_per_env[selected] += 1
+                    episode_reward[done_mask] = 0
+                    episode_length[done_mask] = 0
 
-                    if done_mask.any():
-                        # Record completed episodes
-                        for idx in done_mask.nonzero(as_tuple=False).squeeze(-1):
-                            if episodes_per_env[idx] < target_episodes_per_env:
-                                mode_rewards.append(episode_reward[idx].item())
-                                mode_lengths.append(episode_length[idx].item())
-                                episodes_per_env[idx] += 1
-
-                        # Reset the environments that are done
-                        episode_reward[done_mask] = 0
-                        episode_length[done_mask] = 0
-
-                # Store results for this mode
+                if (episodes_per_env < quotas).any():
+                    raise RuntimeError(
+                        f"Evaluation mode {mode!r} completed {len(mode_rewards)}/{num_episodes} episodes "
+                        f"within {max_steps} steps; the environment did not report enough dones"
+                    )
                 eval_results[mode] = {
-                    "mean_reward": np.mean(mode_rewards) if mode_rewards else 0,
-                    "std_reward": np.std(mode_rewards) if mode_rewards else 0,
-                    "mean_length": np.mean(mode_lengths) if mode_lengths else 0,
-                    "std_length": np.std(mode_lengths) if mode_lengths else 0,
-                    "num_episodes": len(mode_rewards)
+                    "mean_reward": float(np.mean(mode_rewards)),
+                    "std_reward": float(np.std(mode_rewards)),
+                    "mean_length": float(np.mean(mode_lengths)),
+                    "std_length": float(np.std(mode_lengths)),
+                    "num_episodes": len(mode_rewards),
+                    "timeout_rate": float(np.mean(mode_timeouts))
+                    if len(mode_timeouts) == num_episodes
+                    else None,
                 }
 
-            # Restore original model and normalizer state
-            self.alg.policy.load_state_dict(current_model_state)
-            if self.empirical_normalization:
-                self.obs_normalizer.load_state_dict(current_obs_norm_state)
-                self.privileged_obs_normalizer.load_state_dict(current_priv_obs_norm_state)
-
-            # Switch back to train mode
-            self.train_mode()
-
-            # Clear GPU cache
-            torch.cuda.empty_cache()
-
-            return eval_results
-
-        except Exception as e:
-            print(f"Warning: Failed to evaluate checkpoint at iteration {iteration}: {e}")
-            # Attempt to restore state even on failure
+        except Exception as e:  # noqa: BLE001 - preserve evaluation's None-on-error API
+            print(
+                f"Warning: Failed to evaluate checkpoint at iteration {iteration}: {e}"
+            )
+            eval_results = None
+        finally:
             try:
                 if current_model_state is not None:
                     self.alg.policy.load_state_dict(current_model_state)
                 if self.empirical_normalization and current_obs_norm_state is not None:
                     self.obs_normalizer.load_state_dict(current_obs_norm_state)
-                    self.privileged_obs_normalizer.load_state_dict(current_priv_obs_norm_state)
-                self.train_mode()
-            except:
-                pass
-            return None
+                    self.privileged_obs_normalizer.load_state_dict(
+                        current_priv_obs_norm_state
+                    )
+                for module, training in current_modes.items():
+                    module.train(training)
+            except Exception as e:  # noqa: BLE001 - report restoration failures to callers
+                print(
+                    f"Warning: Failed to restore state after checkpoint evaluation: {e}"
+                )
+                eval_results = None
+            random.setstate(python_rng_state)
+            np.random.set_state(numpy_rng_state)
+            torch.random.set_rng_state(torch_rng_state)
+            if cuda_rng_states is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_states)
+        return eval_results
 
     def run_post_training_checkpoint_eval(self):
         """Run post-training evaluation on all saved checkpoints.

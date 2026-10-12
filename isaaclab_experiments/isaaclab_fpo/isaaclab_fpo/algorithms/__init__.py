@@ -8,7 +8,9 @@
 from .fpo import FPO, FSPPO, IMFFPO, PMFFPO
 from .fsppo_codebook import FSPPOCodebook
 from .fsppo_joint import FSPPOJoint
+from .fsppo_joint_aligned import FSPPOJointAligned
 from .fsppo_joint_endpoint import FSPPOJointEndpoint
+from .pmf_pmd import PMFPMD
 
 __all__ = [
     "FPO",
@@ -16,6 +18,8 @@ __all__ = [
     "IMFFPO",
     "PMFFPO",
     "FSPPOJoint",
+    "FSPPOJointAligned",
     "FSPPOJointEndpoint",
     "FSPPOCodebook",
+    "PMFPMD",
 ]

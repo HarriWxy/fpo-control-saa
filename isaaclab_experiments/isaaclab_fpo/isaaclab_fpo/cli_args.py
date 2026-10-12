@@ -24,14 +24,17 @@ def add_fpo_args(parser: argparse.ArgumentParser):
             "pmf_fpo",
             "fsppo",
             "fsppo_joint",
+            "fsppo_joint_aligned",
             "fsppo_joint_endpoint",
+            "pmf_pmd",
         ),
         help=(
             "Policy variant. 'imf_fpo' selects Improved MeanFlow and "
             "'pmf_fpo' selects Pixel MeanFlow; 'fsppo' adds a same-noise "
             "transport-map trust region; 'fsppo_joint' selects the exact "
             "joint-latent Gaussian PPO variant; 'fsppo_joint_endpoint' "
-            "selects the terminal-action MAE comparison; omitted keeps the "
+            "selects the terminal-action MAE comparison; 'pmf_pmd' selects "
+            "state-wise Q improvement and pure weighted pMF projection; omitted keeps the "
             "task default."
         ),
     )
@@ -126,6 +129,28 @@ def update_fpo_cfg(agent_cfg: FpoRslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.algorithm.knn_entropy_coef = 0.0
         if args_cli.experiment_name is None:
             agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_fsppo"
+    elif algorithm_variant == "pmf_pmd":
+        agent_cfg.policy.class_name = "PMFActorCritic"
+        agent_cfg.algorithm.class_name = "PMFPMD"
+        agent_cfg.policy.sampling_steps = 1
+        agent_cfg.algorithm.schedule = "fixed"
+        agent_cfg.algorithm.knn_entropy_coef = 0.0
+        agent_cfg.algorithm.storage_action_noise_std = 0.0
+        agent_cfg.algorithm.trust_region_mode = "ppo"
+        agent_cfg.algorithm.fsppo_joint_aux_loss_coef = 0.0
+        agent_cfg.algorithm.fsppo_joint_entropy_coef = 0.0
+        if args_cli.experiment_name is None:
+            agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_pmf_pmd"
+    elif algorithm_variant == "fsppo_joint_aligned":
+        agent_cfg.policy.class_name = "LearnedStdPMFActorCritic"
+        agent_cfg.algorithm.class_name = "FSPPOJointAligned"
+        agent_cfg.policy.sampling_steps = 1
+        agent_cfg.algorithm.schedule = "adaptive"
+        agent_cfg.algorithm.knn_entropy_coef = 0.0
+        agent_cfg.algorithm.trust_region_mode = "ppo"
+        agent_cfg.algorithm.fsppo_joint_enable_budget = False
+        if args_cli.experiment_name is None:
+            agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_fsppo_joint_aligned"
     elif algorithm_variant == "fsppo_joint":
         agent_cfg.policy.class_name = "PMFActorCritic"
         agent_cfg.algorithm.class_name = "FSPPOJoint"

@@ -183,6 +183,19 @@ class FpoRslRlVecEnvWrapper(VecEnv):
         # this is only needed for infinite horizon tasks
         if not self.unwrapped.cfg.is_finite_horizon:
             extras["time_outs"] = truncated
+        # Native ManagerBasedRLEnv captures this full batch before _reset_idx
+        # when compute_final_obs=True. Q targets need the actual timeout state.
+        # The environment reuses extras, so remove last step's terminal tensor.
+        extras.pop("terminal_critic_observations", None)
+        if bool(truncated.any()) and getattr(self.unwrapped.cfg, "compute_final_obs", False):
+            final_obs = extras.get("final_obs")
+            if final_obs is None:
+                raise RuntimeError("compute_final_obs did not provide pre-reset observations")
+            group = "critic" if self.num_privileged_obs else "policy"
+            terminal = final_obs[group]
+            if not isinstance(terminal, torch.Tensor):
+                raise TypeError("Terminal critic observation group must be a flat tensor")
+            extras["terminal_critic_observations"] = terminal.clone()
 
         # return the step information
         return obs, rew, dones, extras
