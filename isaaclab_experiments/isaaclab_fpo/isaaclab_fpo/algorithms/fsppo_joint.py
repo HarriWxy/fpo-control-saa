@@ -43,6 +43,12 @@ class FSPPOJoint(FPO):
     policy ratio.
     """
 
+    # Logging-only map-distance estimate used by the cheap diagnostic mode.
+    # The budgeted path keeps the full ``fsppo_joint_map_samples`` width
+    # because its value enters gradients.
+    diagnostic_obs_samples = 256
+    diagnostic_map_samples = 2
+
     def __init__(
         self,
         policy: PMFActorCritic,
@@ -137,6 +143,7 @@ class FSPPOJoint(FPO):
             "num_mini_batches",
             "fsppo_joint_map_samples",
             "fsppo_joint_probe_size",
+            "fsppo_joint_replay_check_interval",
             "n_samples_per_action",
         ):
             value = getattr(cfg, name)
@@ -199,6 +206,8 @@ class FSPPOJoint(FPO):
         self.aux_weight_clip = cfg.fsppo_joint_aux_weight_clip
         self.aux_target = cfg.fsppo_joint_aux_target
         self.entropy_coef = cfg.fsppo_joint_entropy_coef
+        self.cheap_map_diagnostics = bool(cfg.fsppo_joint_cheap_map_diagnostics)
+        self.replay_check_interval = cfg.fsppo_joint_replay_check_interval
         self._sampler_contract = self._current_sampler_contract()
         self._old_actor = copy.deepcopy(self.policy.actor).requires_grad_(False).eval()
 
@@ -312,8 +321,11 @@ class FSPPOJoint(FPO):
         self._old_actor.load_state_dict(self.policy.actor.state_dict())
         probe = self._make_probe()
         # Prove that replay still refers to the behavior actor, not an EMA or
-        # a policy changed between collection and update.
-        self._validate_replay()
+        # a policy changed between collection and update.  The sweep costs
+        # about one rollout of actor replays, so thin it with
+        # fsppo_joint_replay_check_interval (update counter 0 always runs).
+        if self.update_counter % self.replay_check_interval == 0:
+            self._validate_replay()
         aux_weight_metrics = self._prepare_aux_weights()
         totals: dict[str, torch.Tensor] = {}
         accepted = rejected = attempted = 0
@@ -762,6 +774,34 @@ class FSPPOJoint(FPO):
         current_mean = self.policy.transport_actions(probe["obs"], probe["noise"])
         return self._gaussian_kl(current_mean, probe["old_actions"], probe["old_std"])
 
+    @torch.no_grad()
+    def _map_kl_diagnostic(self, obs: torch.Tensor) -> torch.Tensor:
+        """Estimate the plain-PMF map distance for logging only.
+
+        Without the budget this value never enters the loss or a schedule.
+        With ``fsppo_joint_cheap_map_diagnostics`` it uses a random rollout
+        subset with ``diagnostic_map_samples`` same-noise samples per row;
+        otherwise it keeps the exact full-batch ``map_samples`` width.
+        """
+        if self.cheap_map_diagnostics:
+            if obs.shape[0] > self.diagnostic_obs_samples:
+                indices = torch.randperm(obs.shape[0], device=obs.device)[
+                    : self.diagnostic_obs_samples
+                ]
+                obs = obs[indices]
+            map_samples = self.diagnostic_map_samples
+        else:
+            map_samples = self.map_samples
+        noise = torch.randn(
+            obs.shape[0],
+            map_samples,
+            self.policy.num_actions,
+            device=self.device,
+        )
+        current_map = self.policy.transport_actions(obs, noise)
+        old_map = self.policy.transport_actions(obs, noise, actor=self._old_actor)
+        return (current_map - old_map).absolute().sum(dim=-1).mean()
+
     def _batch_loss(
         self, batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -798,7 +838,9 @@ class FSPPOJoint(FPO):
                 map_kl = self._gaussian_kl(
                     mean, batch["action_means"], batch["action_stds"]
                 ).mean()
-        else:
+        elif self.enable_budget:
+            # The budgeted penalty is part of the loss: it differentiates
+            # through the current map at the full map-sample width.
             noise = torch.randn(
                 obs.shape[0],
                 self.map_samples,
@@ -816,6 +858,10 @@ class FSPPOJoint(FPO):
                 ).mean()
             else:
                 map_kl = (current_map - old_map).absolute().sum(dim=-1).mean()
+        else:
+            # Without a budget the plain-PMF map_kl is log-only: never build
+            # its autograd graph and optionally skip its full-width sampling.
+            map_kl = self._map_kl_diagnostic(obs)
         aux_target = batch["action_means"] if self.aux_target == "means" else actions
         aux_loss, aux_metrics = self._auxiliary_loss(
             obs, aux_target.detach(), batch.get("aux_weights")

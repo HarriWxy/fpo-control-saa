@@ -456,6 +456,28 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     fsppo_joint_map_samples: int = 2
     """Number of same-noise pMF map samples per state for FSPPOJoint losses."""
 
+    fsppo_joint_cheap_map_diagnostics: bool = False
+    """Estimate the budget-free map-distance log on a small random subset.
+
+    Without the transport budget, the plain-PMF ``map_kl`` never enters the
+    loss or any schedule and only feeds TensorBoard.  ``True`` estimates it
+    from ``FSPPOJoint.diagnostic_obs_samples`` random rollout rows with
+    ``FSPPOJoint.diagnostic_map_samples`` same-noise samples per row instead
+    of the full-batch ``fsppo_joint_map_samples``-wide evaluation (which also
+    built an unused autograd graph).  ``False`` preserves that exact
+    full-width diagnostic.  The budgeted penalty and the Gaussian-residual
+    stored-latent diagnostic are unaffected in both modes.
+    """
+
+    fsppo_joint_replay_check_interval: int = 1
+    """Run FSPPOJoint's behavior-replay contract sweep every N updates.
+
+    The sweep costs about one rollout-sized actor replay and exists to catch
+    behavior-policy drift between collection and update.  1 keeps the
+    historical per-update check; larger values thin it (update counter 0 is
+    always checked).
+    """
+
     fsppo_joint_probe_size: int = 1024
     """Fixed-probe sample count used to accept or reject FSPPOJoint candidates."""
 
